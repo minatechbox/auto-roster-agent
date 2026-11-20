@@ -1,3 +1,4 @@
+import { saveDraftRoster } from "@/lib/db/rosters";
 import { NextRequest, NextResponse } from "next/server";
 import type {
   ImageIntake,
@@ -197,27 +198,39 @@ export async function POST(req: NextRequest) {
     })),
   ];
 
-  const roster: WeekRoster = {
-    id: null,
+  const saveResult = await saveDraftRoster({
     weekStart: rawWeekStart,
     isoWeek: getIsoWeekLabel(rawWeekStart),
-    status: "draft",
     department: department ?? parsedResult.parsed.employees[0]?.department ?? null,
     source: kind,
     mode: parsedResult.mode,
     parsed: parsedResult.parsed,
     schedule: scheduleResult.schedule,
     warnings: combinedWarnings,
-    createdAt: null,
-    approvedAt: null,
-  };
+  });
+
+  const finalWarnings: RosterWarning[] = [
+    ...combinedWarnings,
+    ...(saveResult.error
+      ? [
+          {
+            date: rawWeekStart,
+            shift: "AM" as const,
+            message: saveResult.error,
+          },
+        ]
+      : []),
+  ];
 
   return NextResponse.json(
     {
-      roster,
+      roster: {
+        ...saveResult.roster,
+        warnings: finalWarnings,
+      },
       mode: parsedResult.mode,
-      persisted: false,
-      warnings: combinedWarnings,
+      persisted: saveResult.persisted,
+      warnings: finalWarnings,
     },
     { status: 200 }
   );
