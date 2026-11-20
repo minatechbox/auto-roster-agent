@@ -183,8 +183,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 注意：若你原本 lib/roster/schedule.ts 的 buildWeekSchedule 接受不同參數形狀，
-  // 只要將下面一行改成你 schedule.ts 的呼叫方式即可。
   const scheduleResult = buildWeekSchedule({
     weekStart: rawWeekStart,
     employees: parsedResult.parsed.employees,
