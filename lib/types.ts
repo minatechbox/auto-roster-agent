@@ -6,26 +6,29 @@ export type Shift = (typeof SHIFTS)[number];
 export const WORKING_SHIFTS = ["AM", "PM"] as const;
 export type WorkingShift = (typeof WORKING_SHIFTS)[number];
 
+/** Week starts on Sunday (Day 1) and ends on Saturday (Day 7). */
 export const WEEKDAY_KEYS = [
+  "sun",
   "mon",
   "tue",
   "wed",
   "thu",
   "fri",
   "sat",
-  "sun",
 ] as const;
 export type WeekdayKey = (typeof WEEKDAY_KEYS)[number];
 
 export const WEEKDAY_LABELS: Record<WeekdayKey, string> = {
+  sun: "星期日",
   mon: "星期一",
   tue: "星期二",
   wed: "星期三",
   thu: "星期四",
   fri: "星期五",
   sat: "星期六",
-  sun: "星期日",
 };
+
+export type StaffCategory = "full_time" | "half_full_time" | "part_time";
 
 export const ROSTER_STATUSES = ["draft", "approved"] as const;
 export type RosterStatus = (typeof ROSTER_STATUSES)[number];
@@ -36,7 +39,7 @@ export type RosterMode = "live" | "mock";
 export interface TextIntake {
   kind: "text";
   text: string;
-  /** Monday of the target week, YYYY-MM-DD. */
+  /** Start date of the target week (Sunday), YYYY-MM-DD. */
   weekStart?: string;
   department?: string;
 }
@@ -57,16 +60,15 @@ export interface MockIntake {
 
 export type IntakeInput = TextIntake | ImageIntake | MockIntake;
 
-/** One employee's leave dates and shifts they can actually work. */
 export interface EmployeeAvailability {
   name: string;
   department: string;
-  /** ISO dates (YYYY-MM-DD). Leave overrides anything listed in `available`. */
+  category?: StaffCategory;
+  /** Full-time / half-full-time requested off dates (YYYY-MM-DD). */
   leave: string[];
-  /**
-   * Shifts the employee can work, keyed by weekday.
-   * A missing day, or a missing shift, means they must not be scheduled.
-   */
+  /** Part-time available work dates (YYYY-MM-DD). */
+  availableDates?: string[];
+  /** Optional shift preference by weekday. */
   available: Partial<Record<WeekdayKey, WorkingShift[]>>;
 }
 
@@ -79,20 +81,35 @@ export interface Assignment {
   shift: WorkingShift;
   employee: string;
   department: string;
+  hours?: number;
+  timeSlot?: string;
 }
 
-/** One Monday–Sunday roster grid. Unassigned cells are OFF, not stored here. */
+export interface DailyHourSummary {
+  date: string;
+  totalHours: number;
+  headcount: number;
+}
+
+export interface EmployeeHourSummary {
+  employee: string;
+  totalHours: number;
+  shiftsCount: number;
+}
+
 export interface Schedule {
   days: string[];
   shifts: WorkingShift[];
   assignments: Assignment[];
+  dailyHours?: DailyHourSummary[];
+  employeeHours?: EmployeeHourSummary[];
 }
 
 export interface RosterWarning {
   date: string;
   shift: WorkingShift;
-  /** Example: `11/22 PM 人手不足` */
   message: string;
+  needsManagerAction?: boolean;
 }
 
 export interface ScheduleResult {

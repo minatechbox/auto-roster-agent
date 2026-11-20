@@ -1,7 +1,7 @@
-"use client";
+﻿"use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { WORKING_SHIFTS, type RosterWarning, type WeekRoster } from "@/lib/types";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { type RosterWarning, type WeekRoster } from "@/lib/types";
 
 interface RosterApiResponse {
   rosters?: WeekRoster[];
@@ -11,6 +11,7 @@ interface RosterApiResponse {
 interface ParseAndScheduleResponse {
   roster?: WeekRoster;
   persisted?: boolean;
+  mode?: string;
   warnings?: RosterWarning[];
   error?: string;
 }
@@ -21,12 +22,36 @@ interface ApproveResponse {
   error?: string;
 }
 
+const SAMPLE_TEXT = `陳大文：星期一至五 AM/PM 都可以，星期六 AM，星期日放假
+李小美：星期二至六 AM，星期一、日放假
+黃志強：星期一、三、五 PM，星期六全天，2026-11-22 請假`;
+
+const WEEKDAY_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
+
+function formatDayHeader(dateStr: string): { top: string; sub: string } {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) {
+    return { top: dateStr, sub: "" };
+  }
+  const weekday = WEEKDAY_LABELS[d.getUTCDay()] ?? "";
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return { top: `週${weekday}`, sub: `${mm}/${dd}` };
+}
+
 export default function Home() {
   const [rosters, setRosters] = useState<WeekRoster[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadingList, setLoadingList] = useState<boolean>(true);
+  const [generatingDb, setGeneratingDb] = useState<boolean>(false);
   const [generatingMock, setGeneratingMock] = useState<boolean>(false);
+  const [submittingText, setSubmittingText] = useState<boolean>(false);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+
+  const [weekStart, setWeekStart] = useState<string>("2026-11-22");
+  const [department, setDepartment] = useState<string>("粉嶺上初 - 樓面");
+  const [availabilityText, setAvailabilityText] = useState<string>(SAMPLE_TEXT);
+
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -62,6 +87,38 @@ export default function Home() {
     void loadRosters();
   }, [loadRosters]);
 
+  async function handleGenerateFromDb() {
+    setGeneratingDb(true);
+    setFeedback(null);
+    setErrorMsg(null);
+    try {
+      const res = await fetch("/api/parse-and-schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "db",
+          weekStart: weekStart.trim() || "2026-11-22",
+          department: department.trim() || undefined,
+        }),
+      });
+      const data = (await res.json()) as ParseAndScheduleResponse;
+      if (!res.ok) {
+        throw new Error(data.error || `由員工庫生成更表失敗（HTTP ${res.status}）`);
+      }
+      const createdId = data.roster?.id ?? null;
+      await loadRosters(createdId);
+      setFeedback(
+        data.persisted
+          ? `已讀取 Supabase 員工資料並建立草稿（ID: ${createdId ?? "—"}）`
+          : "已讀取員工資料生成草稿，但未持久化至 Supabase"
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "由員工庫生成草稿時發生錯誤");
+    } finally {
+      setGeneratingDb(false);
+    }
+  }
+
   async function handleGenerateMock() {
     setGeneratingMock(true);
     setFeedback(null);
@@ -70,7 +127,11 @@ export default function Home() {
       const res = await fetch("/api/parse-and-schedule", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: "mock" }),
+        body: JSON.stringify({
+          kind: "mock",
+          weekStart: weekStart.trim() || undefined,
+          department: department.trim() || undefined,
+        }),
       });
       const data = (await res.json()) as ParseAndScheduleResponse;
       if (!res.ok) {
@@ -87,6 +148,45 @@ export default function Home() {
       setErrorMsg(err instanceof Error ? err.message : "生成草稿時發生錯誤");
     } finally {
       setGeneratingMock(false);
+    }
+  }
+
+  async function handleTextSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!availabilityText.trim()) {
+      setErrorMsg("請先輸入員工可用時段文字。");
+      return;
+    }
+
+    setSubmittingText(true);
+    setFeedback(null);
+    setErrorMsg(null);
+    try {
+      const res = await fetch("/api/parse-and-schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "text",
+          text: availabilityText.trim(),
+          weekStart: weekStart.trim() || "2026-11-22",
+          department: department.trim() || undefined,
+        }),
+      });
+      const data = (await res.json()) as ParseAndScheduleResponse;
+      if (!res.ok) {
+        throw new Error(data.error || `解析文字並生成更表失敗（HTTP ${res.status}）`);
+      }
+      const createdId = data.roster?.id ?? null;
+      await loadRosters(createdId);
+      setFeedback(
+        `已由文字（${data.mode ?? "text"}）建立更表草稿${
+          data.persisted ? "並寫入 Supabase" : "（未寫入 Supabase）"
+        }（ID: ${createdId ?? "—"}）`
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "解析文字時發生錯誤");
+    } finally {
+      setSubmittingText(false);
     }
   }
 
@@ -117,116 +217,494 @@ export default function Home() {
 
   const days = selectedRoster?.schedule?.days ?? [];
   const assignments = selectedRoster?.schedule?.assignments ?? [];
+  const dailyHours = selectedRoster?.schedule?.dailyHours ?? [];
+  const employeeHours = selectedRoster?.schedule?.employeeHours ?? [];
 
-  function getAssignedEmployees(day: string, shift: "AM" | "PM"): string[] {
-    return assignments
-      .filter((a) => a.date === day && a.shift === shift)
-      .map((a) => a.employee);
+  const orderedEmployees: string[] = [];
+  const seenEmp = new Set<string>();
+  for (const emp of selectedRoster?.parsed?.employees ?? []) {
+    if (emp.name && !seenEmp.has(emp.name)) {
+      seenEmp.add(emp.name);
+      orderedEmployees.push(emp.name);
+    }
+  }
+  for (const a of assignments) {
+    if (a.employee && !seenEmp.has(a.employee)) {
+      seenEmp.add(a.employee);
+      orderedEmployees.push(a.employee);
+    }
+  }
+
+  const leaveMap = new Map<string, Set<string>>();
+  for (const emp of selectedRoster?.parsed?.employees ?? []) {
+    leaveMap.set(emp.name, new Set(emp.leave ?? []));
+  }
+
+  const empHoursMap = new Map<string, { totalHours: number; shiftsCount: number }>();
+  for (const eh of employeeHours) {
+    empHoursMap.set(eh.employee, {
+      totalHours: eh.totalHours,
+      shiftsCount: eh.shiftsCount,
+    });
+  }
+
+  const dailyHoursMap = new Map<string, { headcount: number; totalHours: number }>();
+  for (const dh of dailyHours) {
+    dailyHoursMap.set(dh.date, {
+      headcount: dh.headcount,
+      totalHours: dh.totalHours,
+    });
+  }
+
+  function getCellDisplay(employee: string, day: string): {
+    label: string;
+    sub?: string;
+    kind: "work" | "leave" | "off";
+  } {
+    const matched = assignments.filter(
+      (a) => a.employee === employee && a.date === day
+    );
+    if (matched.length > 0) {
+      const slots = matched.map((m) => m.timeSlot || m.shift).join(" / ");
+      const totalH = matched.reduce((sum, m) => sum + (m.hours ?? 0), 0);
+      return {
+        label: slots,
+        sub: totalH > 0 ? `${totalH}h` : undefined,
+        kind: "work",
+      };
+    }
+    if (leaveMap.get(employee)?.has(day)) {
+      return { label: "請假", kind: "leave" };
+    }
+    return { label: "OFF", kind: "off" };
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="mx-auto max-w-6xl px-6 py-8">
-        <header className="flex flex-col gap-4 border-b border-zinc-200 pb-6 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
+    <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 print:bg-white print:text-black">
+      {/* 列印專用樣式：A4 橫向、隱藏操作介面、黑框白底清晰字體 */}
+      <style jsx global>{`
+        @media print {
+          @page {
+            size: A4 landscape;
+            margin: 10mm;
+          }
+          body {
+            background: #ffffff !important;
+            color: #000000 !important;
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+          }
+          .no-print {
+            display: none !important;
+          }
+          .print-area {
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            background: #ffffff !important;
+          }
+          .print-table {
+            min-width: 100% !important;
+            width: 100% !important;
+            font-size: 10px !important;
+          }
+          .print-table th,
+          .print-table td {
+            border: 1px solid #333333 !important;
+            padding: 4px 6px !important;
+            position: static !important;
+          }
+        }
+      `}</style>
+
+      <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 print:max-w-none print:p-0">
+        <header className="no-print flex flex-col gap-4 border-b border-zinc-200 pb-5 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">
-              Auto Roster Agent — 更表草稿與批准控制台
+              初遇 · 自動排班代理控制台
             </h1>
             <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              檢視 Supabase 內嘅每週更表草稿、排班警告與更表安排，並一鍵批准。
+              週日開週制 · 員工橫向更表、工時核算、六大時段核數及放假超額提示。
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
               onClick={() => void loadRosters(selectedId)}
               disabled={loadingList}
-              className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              className="rounded-lg border border-zinc-300 bg-white px-3.5 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
             >
-              {loadingList ? "重新載入中..." : "重新整理"}
+              {loadingList ? "載入中..." : "重新整理"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleGenerateFromDb()}
+              disabled={generatingDb}
+              className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {generatingDb ? "讀取 DB 排班中..." : "由 DB 員工庫生成草稿"}
             </button>
             <button
               type="button"
               onClick={() => void handleGenerateMock()}
               disabled={generatingMock}
-              className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              className="rounded-lg bg-zinc-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
             >
-              {generatingMock ? "生成中..." : "+ 生成 Mock 草稿"}
+              {generatingMock ? "生成中..." : "+ Mock 草稿"}
             </button>
           </div>
         </header>
 
+        {/* 簡潔單行設定 + 可收合文字輸入（列印時自動隱藏） */}
+        <section className="no-print mt-5 rounded-xl border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <form onSubmit={(e) => void handleTextSubmit(e)} className="space-y-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div>
+                <label
+                  htmlFor="weekStart"
+                  className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
+                >
+                  每週起始日（星期日）
+                </label>
+                <input
+                  id="weekStart"
+                  type="date"
+                  value={weekStart}
+                  onChange={(e) => setWeekStart(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="department"
+                  className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
+                >
+                  部門名稱
+                </label>
+                <input
+                  id="department"
+                  type="text"
+                  value={department}
+                  onChange={(e) => setDepartment(e.target.value)}
+                  placeholder="粉嶺上初 - 樓面"
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                />
+              </div>
+              <div className="flex items-end justify-end gap-2">
+                <button
+                  type="submit"
+                  disabled={submittingText}
+                  className="w-full rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-50 sm:w-auto"
+                >
+                  {submittingText ? "解析排班中..." : "解析下方文字生成草稿"}
+                </button>
+              </div>
+            </div>
+
+            <details className="group">
+              <summary className="cursor-pointer select-none text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200">
+                展開／收起 WhatsApp 覆期文字輸入框
+              </summary>
+              <div className="mt-2 space-y-2">
+                <textarea
+                  id="availabilityText"
+                  rows={3}
+                  value={availabilityText}
+                  onChange={(e) => setAvailabilityText(e.target.value)}
+                  placeholder="貼上員工可用更期、請假日期..."
+                  className="w-full rounded-lg border border-zinc-300 bg-white p-2.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                />
+                <button
+                  type="button"
+                  onClick={() => setAvailabilityText(SAMPLE_TEXT)}
+                  className="text-xs text-zinc-500 underline hover:text-zinc-800"
+                >
+                  填入範例覆期文字
+                </button>
+              </div>
+            </details>
+          </form>
+        </section>
+
         {feedback && (
-          <div className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
+          <div className="no-print mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
             {feedback}
           </div>
         )}
 
         {errorMsg && (
-          <div className="mt-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/60 dark:text-red-200">
+          <div className="no-print mt-4 rounded-lg border border-red-300 bg-red-50 px-4 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/60 dark:text-red-200">
             {errorMsg}
           </div>
         )}
 
-        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-12">
-          {/* 左欄：更表列表 */}
-          <section className="lg:col-span-5">
-            <div className="rounded-xl border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-base font-semibold">更表紀錄（{rosters.length}）</h2>
-                <span className="text-xs text-zinc-500">最新優先</span>
+        {/* 更表紀錄橫向切換條（列印時自動隱藏） */}
+        <section className="no-print mt-5">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+              更表紀錄（{rosters.length} 份 · 點擊切換）
+            </h2>
+          </div>
+          {loadingList && rosters.length === 0 ? (
+            <p className="text-xs text-zinc-500">正在讀取更表紀錄...</p>
+          ) : rosters.length === 0 ? (
+            <p className="text-xs text-zinc-500">
+              暫無更表紀錄，請按右上角「由 DB 員工庫生成草稿」。
+            </p>
+          ) : (
+            <div className="flex gap-2.5 overflow-x-auto pb-2">
+              {rosters.map((item, idx) => {
+                const key = item.id ?? `temp-${idx}`;
+                const isSelected = selectedRoster?.id === item.id && item.id !== null;
+                const isApproved = item.status === "approved";
+
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => item.id && setSelectedId(item.id)}
+                    className={`min-w-[210px] shrink-0 rounded-lg border p-2.5 text-left transition ${
+                      isSelected
+                        ? "border-indigo-600 bg-indigo-50/70 ring-1 ring-indigo-600 dark:border-indigo-400 dark:bg-indigo-950/40"
+                        : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold">
+                        {item.isoWeek} ({item.weekStart})
+                      </span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          isApproved
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-amber-100 text-amber-800"
+                        }`}
+                      >
+                        {item.status}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-zinc-500">
+                      {item.department || "未分部門"} · 警告 {item.warnings?.length ?? 0} 項
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* 主更表 Matrix 視圖（列印時保留呢一區） */}
+        {selectedRoster && (
+          <section className="print-area mt-4 space-y-5 rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="flex flex-col justify-between gap-3 border-b border-zinc-200 pb-4 dark:border-zinc-800 sm:flex-row sm:items-center print:border-black print:pb-2">
+              <div>
+                <div className="flex items-center gap-2.5">
+                  <h2 className="text-lg font-bold">
+                    {selectedRoster.department || "部門更表"} · {selectedRoster.isoWeek}（
+                    {selectedRoster.weekStart} 起）
+                  </h2>
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-xs font-semibold print:border print:border-black print:bg-white print:text-black ${
+                      selectedRoster.status === "approved"
+                        ? "bg-emerald-100 text-emerald-800"
+                        : "bg-amber-100 text-amber-800"
+                    }`}
+                  >
+                    {selectedRoster.status === "approved" ? "已批准" : "草稿 (DRAFT)"}
+                  </span>
+                </div>
+                <p className="mt-0.5 text-xs text-zinc-500 print:text-black">
+                  共 {orderedEmployees.length} 位員工 · 列印時間：{new Date().toLocaleDateString("zh-HK")}
+                </p>
               </div>
 
-              {loadingList && rosters.length === 0 ? (
-                <p className="py-8 text-center text-sm text-zinc-500">
-                  正在讀取更表紀錄...
-                </p>
-              ) : rosters.length === 0 ? (
-                <p className="py-8 text-center text-sm text-zinc-500">
-                  暫時未有更表紀錄，可以撳右上角「+ 生成 Mock 草稿」測試。
+              <div className="no-print flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+                >
+                  🖨️ 列印 / 匯出 PDF 更表
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    !selectedRoster.id ||
+                    selectedRoster.status === "approved" ||
+                    approvingId === selectedRoster.id
+                  }
+                  onClick={() => void handleApprove(selectedRoster.id)}
+                  className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {selectedRoster.status === "approved"
+                    ? "已批准"
+                    : approvingId === selectedRoster.id
+                    ? "批准中..."
+                    : "批准此更表"}
+                </button>
+              </div>
+            </div>
+
+            {/* 橫向一覽排更表（每位員工一行、週日至週六七欄） */}
+            <div>
+              <div className="no-print mb-2 flex items-center justify-between">
+                <h3 className="text-sm font-semibold">員工週更表（一目了然）</h3>
+                <span className="text-xs text-zinc-500">
+                  藍底＝當值更期 ｜ 紅底＝請假 ｜ 灰字＝OFF
+                </span>
+              </div>
+
+              {days.length === 0 || orderedEmployees.length === 0 ? (
+                <p className="py-6 text-center text-xs text-zinc-500">
+                  暫無可顯示的員工排班資料。
                 </p>
               ) : (
-                <ul className="space-y-2.5">
-                  {rosters.map((item, idx) => {
-                    const key = item.id ?? `temp-${idx}`;
-                    const isSelected = selectedRoster?.id === item.id && item.id !== null;
-                    const isApproved = item.status === "approved";
-
-                    return (
-                      <li key={key}>
-                        <button
-                          type="button"
-                          onClick={() => item.id && setSelectedId(item.id)}
-                          className={`w-full rounded-lg border p-3 text-left transition ${
-                            isSelected
-                              ? "border-zinc-900 bg-zinc-50 dark:border-zinc-200 dark:bg-zinc-800/80"
-                              : "border-zinc-200 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/40"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-medium text-sm">
-                              {item.isoWeek}（{item.weekStart}）
-                            </span>
-                            <span
-                              className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                                isApproved
-                                  ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200"
-                                  : "bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200"
+                <div className="overflow-x-auto rounded-lg border border-zinc-300 dark:border-zinc-700 print:overflow-visible print:border-none">
+                  <table className="print-table w-full min-w-[920px] border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-zinc-300 bg-zinc-100 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 print:bg-zinc-200 print:text-black">
+                        <th className="sticky left-0 z-10 w-44 border-r border-zinc-300 bg-zinc-100 px-3 py-2.5 text-left font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
+                          員工姓名
+                        </th>
+                        {days.map((day) => {
+                          const h = formatDayHeader(day);
+                          return (
+                            <th
+                              key={day}
+                              className="border-r border-zinc-300 px-2 py-2 text-center font-semibold dark:border-zinc-700"
+                            >
+                              <div>{h.top}</div>
+                              <div className="font-mono text-[11px] font-normal text-zinc-500 dark:text-zinc-400 print:text-black">
+                                {h.sub}
+                              </div>
+                            </th>
+                          );
+                        })}
+                        <th className="w-24 bg-zinc-100 px-2.5 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
+                          本週工時
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {orderedEmployees.map((emp, rowIdx) => {
+                        const stats = empHoursMap.get(emp);
+                        const over60 = (stats?.totalHours ?? 0) > 60;
+                        return (
+                          <tr
+                            key={emp}
+                            className={`border-b border-zinc-200 dark:border-zinc-800 ${
+                              rowIdx % 2 === 0
+                                ? "bg-white dark:bg-zinc-950"
+                                : "bg-zinc-50/60 dark:bg-zinc-900/60"
+                            }`}
+                          >
+                            <td className="sticky left-0 z-10 border-r border-zinc-300 bg-inherit px-3 py-2 font-semibold text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 print:text-black">
+                              {emp}
+                            </td>
+                            {days.map((day) => {
+                              const cell = getCellDisplay(emp, day);
+                              return (
+                                <td
+                                  key={day}
+                                  className="border-r border-zinc-200 px-1.5 py-1.5 text-center dark:border-zinc-800"
+                                >
+                                  {cell.kind === "work" ? (
+                                    <div className="rounded bg-blue-50 px-1.5 py-1 font-mono text-[11px] font-medium text-blue-900 ring-1 ring-blue-200 dark:bg-blue-950/60 dark:text-blue-200 dark:ring-blue-800 print:bg-white print:text-black print:ring-0">
+                                      <div>{cell.label}</div>
+                                      {cell.sub && (
+                                        <div className="text-[10px] text-blue-600 dark:text-blue-400 print:text-black">
+                                          {cell.sub}
+                                        </div>
+                                      )}
+                                    </div>
+                                  ) : cell.kind === "leave" ? (
+                                    <span className="inline-block rounded bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700 ring-1 ring-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:ring-rose-800 print:bg-white print:font-bold print:text-black print:ring-0">
+                                      請假
+                                    </span>
+                                  ) : (
+                                    <span className="text-[11px] text-zinc-400 print:text-zinc-500">
+                                      OFF
+                                    </span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                            <td
+                              className={`px-2 py-2 text-center font-mono font-semibold ${
+                                over60
+                                  ? "bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-300 print:bg-white print:text-black"
+                                  : "text-zinc-800 dark:text-zinc-200 print:text-black"
                               }`}
                             >
-                              {item.status}
-                            </span>
-                          </div>
-                          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-                            <span>
-                              {item.department || "未分部門"} · {item.source} · {item.mode} · 警告{" "}
-                              {item.warnings?.length ?? 0} 項
-                            </span>
-                            <span className="truncate max-w-[140px]">
-                              {item.id ?? "未儲存"}
-                            </span>
-                          </div>
-                        </button>
+                              {stats ? `${stats.totalHours}h` : "0h"}
+                              {stats && (
+                                <div className="text-[10px] font-normal text-zinc-500 print:text-black">
+                                  ({stats.shiftsCount}日)
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t-2 border-zinc-300 bg-zinc-100 font-semibold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200 print:text-black">
+                        <td className="sticky left-0 z-10 border-r border-zinc-300 bg-zinc-100 px-3 py-2 text-left dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
+                          每日在崗 / 總工時
+                        </td>
+                        {days.map((day) => {
+                          const dh = dailyHoursMap.get(day);
+                          return (
+                            <td
+                              key={day}
+                              className="border-r border-zinc-300 px-2 py-2 text-center font-mono text-[11px] dark:border-zinc-700"
+                            >
+                              <div>{dh ? `${dh.headcount} 人` : "0 人"}</div>
+                              <div className="text-zinc-600 dark:text-zinc-400 print:text-black">
+                                {dh ? `${dh.totalHours}h` : "0h"}
+                              </div>
+                            </td>
+                          );
+                        })}
+                        <td className="px-2 py-2 text-center font-mono text-[11px]">
+                          {dailyHours.reduce((s, d) => s + d.totalHours, 0)}h
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* 警告與六大時段核數（列印時自動隱藏，保持更表乾淨） */}
+            <div className="no-print">
+              <h3 className="text-sm font-semibold">
+                排班警告與六大時段核數（{selectedRoster.warnings?.length ?? 0} 項）
+              </h3>
+              {!selectedRoster.warnings || selectedRoster.warnings.length === 0 ? (
+                <p className="mt-1.5 text-xs text-zinc-500">
+                  暫無排班警告，各時段人手達標。
+                </p>
+              ) : (
+                <ul className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
+                  {selectedRoster.warnings.map((w, i) => {
+                    const isManagerAlert = Boolean(w.needsManagerAction);
+                    return (
+                      <li
+                        key={`${w.date}-${w.shift}-${i}`}
+                        className={`rounded-md border px-3 py-2 text-xs ${
+                          isManagerAlert
+                            ? "border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950/60 dark:text-red-200"
+                            : "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+                        }`}
+                      >
+                        {isManagerAlert && (
+                          <span className="mr-1.5 inline-block rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                            ⚠️ 請管理員指示
+                          </span>
+                        )}
+                        <span className="font-semibold">[{w.date}]</span> {w.message}
                       </li>
                     );
                   })}
@@ -234,134 +712,7 @@ export default function Home() {
               )}
             </div>
           </section>
-
-          {/* 右欄：選中更表明細與批准操作 */}
-          <section className="lg:col-span-7">
-            <div className="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
-              {!selectedRoster ? (
-                <p className="py-12 text-center text-sm text-zinc-500">
-                  請喺左邊揀一份更表檢視詳情。
-                </p>
-              ) : (
-                <div className="space-y-5">
-                  <div className="flex flex-col justify-between gap-3 border-b border-zinc-200 pb-4 dark:border-zinc-800 sm:flex-row sm:items-center">
-                    <div>
-                      <div className="flex items-center gap-2.5">
-                        <h2 className="text-lg font-semibold">
-                          {selectedRoster.isoWeek}（{selectedRoster.weekStart}）
-                        </h2>
-                        <span
-                          className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                            selectedRoster.status === "approved"
-                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200"
-                              : "bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200"
-                          }`}
-                        >
-                          {selectedRoster.status}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                        ID: {selectedRoster.id ?? "—"} · 建立於{" "}
-                        {selectedRoster.createdAt ?? "—"} · 批准於{" "}
-                        {selectedRoster.approvedAt ?? "尚未批准"}
-                      </p>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={
-                        !selectedRoster.id ||
-                        selectedRoster.status === "approved" ||
-                        approvingId === selectedRoster.id
-                      }
-                      onClick={() => void handleApprove(selectedRoster.id)}
-                      className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      {selectedRoster.status === "approved"
-                        ? "已批准"
-                        : approvingId === selectedRoster.id
-                        ? "批准中..."
-                        : "批准更表"}
-                    </button>
-                  </div>
-
-                  {/* 警告提示 */}
-                  <div>
-                    <h3 className="text-sm font-semibold">
-                      排班警告（{selectedRoster.warnings?.length ?? 0}）
-                    </h3>
-                    {!selectedRoster.warnings || selectedRoster.warnings.length === 0 ? (
-                      <p className="mt-1.5 text-xs text-zinc-500">暫無排班警告。</p>
-                    ) : (
-                      <ul className="mt-2 space-y-1.5">
-                        {selectedRoster.warnings.map((w, i) => (
-                          <li
-                            key={`${w.date}-${w.shift}-${i}`}
-                            className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
-                          >
-                            <span className="font-semibold">
-                              [{w.date} {w.shift}]
-                            </span>{" "}
-                            {w.message}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-
-                  {/* 更表安排表 */}
-                  <div>
-                    <h3 className="text-sm font-semibold">更表安排（AM / PM）</h3>
-                    {days.length === 0 ? (
-                      <p className="mt-1.5 text-xs text-zinc-500">暫無日期資料。</p>
-                    ) : (
-                      <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-                        <table className="w-full border-collapse text-left text-xs">
-                          <thead>
-                            <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950/60">
-                              <th className="px-3 py-2 font-semibold">日期</th>
-                              {WORKING_SHIFTS.map((shift) => (
-                                <th key={shift} className="px-3 py-2 font-semibold">
-                                  {shift}
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {days.map((day) => (
-                              <tr
-                                key={day}
-                                className="border-b border-zinc-100 last:border-b-0 dark:border-zinc-800/70"
-                              >
-                                <td className="px-3 py-2 font-mono">{day}</td>
-                                {WORKING_SHIFTS.map((shift) => {
-                                  const staff = getAssignedEmployees(day, shift);
-                                  return (
-                                    <td key={shift} className="px-3 py-2">
-                                      {staff.length > 0 ? staff.join(", ") : "—"}
-                                    </td>
-                                  );
-                                })}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* 原始排班 JSON */}
-                  <div>
-                    <h3 className="text-sm font-semibold">原始排班 JSON</h3>
-                    <pre className="mt-2 max-h-60 overflow-auto rounded-lg bg-zinc-950 p-3.5 text-xs text-zinc-100">
-                      {JSON.stringify(selectedRoster.schedule, null, 2)}
-                    </pre>
-                  </div>
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
+        )}
       </div>
     </div>
   );
