@@ -7,7 +7,7 @@ import type {
 import { WEEKDAY_KEYS, WORKING_SHIFTS } from "@/lib/types";
 
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
-const DEFAULT_DEPARTMENT = "旺角門市";
+const DEFAULT_DEPARTMENT = "Superme Cafe";
 
 function isValidIsoDateString(value: unknown): value is string {
   if (typeof value !== "string" || !DATE_REGEX.test(value)) {

@@ -22,9 +22,10 @@ interface ApproveResponse {
   error?: string;
 }
 
-const SAMPLE_TEXT = `陳大文：星期一至五 AM/PM 都可以，星期六 AM，星期日放假
-李小美：星期二至六 AM，星期一、日放假
-黃志強：星期一、三、五 PM，星期六全天，2026-11-22 請假`;
+const SAMPLE_TEXT = `Superme Cafe 報更
+Jamie Cole 6000 1001：星期一至五 AM/PM 都可以，星期六 AM，星期日放假
+Noah Blake 6000 1002：星期二至六 AM，星期一、日放假
+Casey Quinn 6000 1003：星期一、三、五 PM，星期六全天，2026-11-22 請假`;
 
 const WEEKDAY_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
 
@@ -49,7 +50,7 @@ export default function Home() {
   const [approvingId, setApprovingId] = useState<string | null>(null);
 
   const [weekStart, setWeekStart] = useState<string>("2026-11-22");
-  const [department, setDepartment] = useState<string>("粉嶺上初 - 樓面");
+  const [department, setDepartment] = useState<string>("Superme Cafe");
   const [availabilityText, setAvailabilityText] = useState<string>(SAMPLE_TEXT);
 
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -387,7 +388,7 @@ export default function Home() {
                   type="text"
                   value={department}
                   onChange={(e) => setDepartment(e.target.value)}
-                  placeholder="粉嶺上初 - 樓面"
+                  placeholder="Superme Cafe"
                   className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
                 />
               </div>

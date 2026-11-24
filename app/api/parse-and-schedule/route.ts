@@ -128,7 +128,7 @@ async function loadEmployeesFromSupabase(
     const hoursNum = Number(row.week_hours ?? 0);
     const category = mapCategoryFromDb(row.employment_type, hoursNum);
     const displayName = row.nickname ? `${row.name} (${row.nickname})` : row.name;
-    const dept = row.department || departmentFilter || "粉嶺上初 - 樓面";
+    const dept = row.department || departmentFilter || "Superme Cafe";
 
     const leave: string[] = [];
     const availableDates: string[] = [];

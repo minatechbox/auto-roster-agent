@@ -3,22 +3,23 @@ import type { EmployeeAvailability, ParsedAvailability } from "../types";
 /** Monday 16 Nov 2026. ISO week 2026-W47. */
 export const SAMPLE_WEEK_START = "2026-11-16";
 export const SAMPLE_ISO_WEEK = "2026-W47";
-export const SAMPLE_DEPARTMENT = "門市";
+export const SAMPLE_DEPARTMENT = "Superme Cafe";
 
 /**
- * WhatsApp-style availability for one shop week.
+ * Fictional cafe availability for demos.
  * Includes full-day leave and shifts a person cannot work.
  */
-export const sampleWeekRawText = `旺角門市報更（11/16–11/22）
+export const sampleWeekRawText = `Superme Cafe 報更（11/16–11/22）
 
-陳大文：11/18 週三請假返鄉下。週日只可上早更（要返教會），其他日子早更、下午更都可以。
-李小美：全週只可上早更，下午要接小朋友，唔可以排下午更。
-黃志強：週六、週日放假。週一至週五早更同下午更都可以。
-張詠詩：只可上下午更，週末唔得。11/19 週四睇醫生請假。`;
+Jamie Cole 6000 1001：11/18 週三請假。週日只可上早更，其他日子早更、下午更都可以。
+Noah Blake 6000 1002：全週只可上早更，唔可以排下午更。
+Casey Quinn 6000 1003：週六、週日放假。週一至週五早更同下午更都可以。
+Riley Shaw 6000 1004：只可上下午更，週末唔得。11/19 週四請假。`;
 
 export const sampleWeekEmployees: EmployeeAvailability[] = [
   {
-    name: "陳大文",
+    name: "Jamie Cole",
+    phone: "6000 1001",
     department: SAMPLE_DEPARTMENT,
     leave: ["2026-11-18"],
     available: {
@@ -31,7 +32,8 @@ export const sampleWeekEmployees: EmployeeAvailability[] = [
     },
   },
   {
-    name: "李小美",
+    name: "Noah Blake",
+    phone: "6000 1002",
     department: SAMPLE_DEPARTMENT,
     leave: [],
     available: {
@@ -45,7 +47,8 @@ export const sampleWeekEmployees: EmployeeAvailability[] = [
     },
   },
   {
-    name: "黃志強",
+    name: "Casey Quinn",
+    phone: "6000 1003",
     department: SAMPLE_DEPARTMENT,
     leave: ["2026-11-21", "2026-11-22"],
     available: {
@@ -57,7 +60,8 @@ export const sampleWeekEmployees: EmployeeAvailability[] = [
     },
   },
   {
-    name: "張詠詩",
+    name: "Riley Shaw",
+    phone: "6000 1004",
     department: SAMPLE_DEPARTMENT,
     leave: ["2026-11-19"],
     available: {

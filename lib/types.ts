@@ -63,6 +63,8 @@ export type IntakeInput = TextIntake | ImageIntake | MockIntake;
 export interface EmployeeAvailability {
   name: string;
   department: string;
+  /** Demo contact only. Never store a real phone number in source. */
+  phone?: string;
   category?: StaffCategory;
   /** Full-time / half-full-time requested off dates (YYYY-MM-DD). */
   leave: string[];
