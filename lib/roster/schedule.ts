@@ -77,6 +77,7 @@ export function buildWeekSchedule(
 
     for (const shift of WORKING_SHIFTS) {
       for (const emp of sortedEmployees) {
+        if (emp.reserve) continue;
         if (assignedToday.has(emp.name)) continue;
         if (!canWork(emp, date, shift)) continue;
 
@@ -101,7 +102,7 @@ export function buildWeekSchedule(
       }
     }
 
-    // 3. 按「初遇」更表底部六大時段核對在崗人數，唔夠就出警告
+    // 3. 按更表底部六大時段核對在崗人數，唔夠就出警告
     const dayAssignments = assignments.filter((a) => a.date === date);
     for (const period of SERVICE_PERIODS) {
       const required = requiredPeriodHeadcount(date, period);
@@ -162,4 +163,33 @@ export function shiftOnDate(
     (item) => item.employee === employeeName && item.date === date,
   );
   return found?.shift ?? "OFF";
+}
+
+export function summarizeSchedule(
+  days: string[],
+  assignments: readonly Assignment[],
+  employeeNames: string[],
+): {
+  dailyHours: DailyHourSummary[];
+  employeeHours: EmployeeHourSummary[];
+} {
+  const dailyHours: DailyHourSummary[] = days.map((date) => {
+    const dayAssignments = assignments.filter((item) => item.date === date);
+    return {
+      date,
+      totalHours: dayAssignments.reduce((sum, item) => sum + (item.hours ?? 0), 0),
+      headcount: dayAssignments.length,
+    };
+  });
+
+  const employeeHours: EmployeeHourSummary[] = employeeNames.map((employee) => {
+    const empAssignments = assignments.filter((item) => item.employee === employee);
+    return {
+      employee,
+      totalHours: empAssignments.reduce((sum, item) => sum + (item.hours ?? 0), 0),
+      shiftsCount: empAssignments.length,
+    };
+  });
+
+  return { dailyHours, employeeHours };
 }

@@ -53,7 +53,7 @@ export async function parseRosterFromText(options: {
     };
   }
 
-  const userPrompt = `排班週期起始日（星期一）：${options.weekStart}\n${
+  const userPrompt = `排班週期起始日（星期日）：${options.weekStart}\n${
     options.department ? `預設部門：${options.department}\n` : ""
   }報更原文：\n${options.text}`;
 

@@ -58,6 +58,21 @@ import type {
       };
     }
   
+    const weekFilter = `week_start=eq.${encodeURIComponent(roster.weekStart)}`;
+    const deptFilter = roster.department
+      ? `&department=eq.${encodeURIComponent(roster.department)}`
+      : "";
+    await fetch(
+      `${client.url}/rest/v1/week_rosters?${weekFilter}${deptFilter}&status=eq.draft`,
+      {
+        method: "DELETE",
+        headers: {
+          apikey: client.serviceRoleKey,
+          Authorization: `Bearer ${client.serviceRoleKey}`,
+        },
+      },
+    );
+
     const res = await fetch(`${client.url}/rest/v1/week_rosters`, {
       method: "POST",
       headers: {
@@ -139,7 +154,13 @@ import type {
     }
   
     const rows = (await res.json()) as WeekRosterRow[];
-    return rows.map(mapRowToWeekRoster);
+    const seen = new Set<string>();
+    return rows.map(mapRowToWeekRoster).filter((item) => {
+      const key = `${item.weekStart}|${item.department ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
   
   export async function approveRosterById(id: string): Promise<WeekRoster | null> {
@@ -170,6 +191,40 @@ import type {
       throw new Error(`更新批准狀態失敗（HTTP ${res.status}）。`);
     }
   
+    const rows = (await res.json()) as WeekRosterRow[];
+    return rows[0] ? mapRowToWeekRoster(rows[0]) : null;
+  }
+
+  export async function updateRosterById(
+    id: string,
+    patch: { parsed: ParsedAvailability; schedule: Schedule },
+  ): Promise<WeekRoster | null> {
+    const client = getSupabaseClient();
+    if (!client) {
+      throw new Error("尚未設定 Supabase 環境變數，無法更新更表。");
+    }
+
+    const res = await fetch(
+      `${client.url}/rest/v1/week_rosters?id=eq.${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: client.serviceRoleKey,
+          Authorization: `Bearer ${client.serviceRoleKey}`,
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({
+          parsed: patch.parsed,
+          schedule: patch.schedule,
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new Error(`更新更表失敗（HTTP ${res.status}）。`);
+    }
+
     const rows = (await res.json()) as WeekRosterRow[];
     return rows[0] ? mapRowToWeekRoster(rows[0]) : null;
   }

@@ -111,6 +111,16 @@ export function weekDates(weekStart: string): string[] {
   });
 }
 
+export function weekEndDate(weekStart: string): string {
+  return weekDates(weekStart)[6];
+}
+
+export function formatWeekRange(weekStart: string): string {
+  const start = parseISODate(weekStart);
+  const end = parseISODate(weekEndDate(weekStart));
+  return `${start.getMonth() + 1}/${start.getDate()}–${end.getMonth() + 1}/${end.getDate()}`;
+}
+
 export function weekdayKeyFromDate(iso: string): WeekdayKey {
   return WEEKDAY_BY_JS_DAY[parseISODate(iso).getDay()];
 }

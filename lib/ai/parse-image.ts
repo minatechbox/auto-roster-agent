@@ -63,7 +63,7 @@ export async function parseRosterFromImage(options: {
           content: [
             {
               type: "text",
-              text: `請辨識這張排班月曆圖片（本週星期一為 ${options.weekStart}${
+              text: `請辨識這張排班月曆／更期相片（本週星期日為 ${options.weekStart}${
                 options.department ? `，預設部門：${options.department}` : ""
               }），輸出每位員工的請假日期與可用更別。`,
             },
