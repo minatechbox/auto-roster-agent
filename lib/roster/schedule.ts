@@ -3,6 +3,7 @@ import type {
   DailyHourSummary,
   EmployeeAvailability,
   EmployeeHourSummary,
+  RosterWarning,
   ScheduleResult,
   Shift,
   StaffCategory,
@@ -16,13 +17,15 @@ import {
   hoursForEmployeeShift,
   hoursWorked,
   isOnLeave,
-  managerActionWarning,
+  leaveExcessWarning,
+  maxAllowedSalariedOff,
   periodCoverageWarningMessage,
   requiredPeriodHeadcount,
   resolveCategory,
   shiftsWorked,
   weekDates,
 } from "./rules";
+import type { ServicePeriodId } from "./rules";
 
 export interface BuildWeekScheduleInput {
   weekStart: string;
@@ -40,32 +43,8 @@ export function buildWeekSchedule(
 ): ScheduleResult {
   const days = weekDates(input.weekStart);
   const assignments: Assignment[] = [];
-  const warnings: ScheduleResult["warnings"] = [];
 
   for (const date of days) {
-    // 1. 先統計當日申請放假人數（長工＋半長工），檢查是否超出限定放假人數
-    const salariedStaff = input.employees.filter((emp) => {
-      const cat = resolveCategory(emp);
-      return cat === "full_time" || cat === "half_full_time";
-    });
-    const requestedOff = salariedStaff.filter((emp) => isOnLeave(emp, date));
-    const maxAllowedOff = Math.max(1, Math.floor(salariedStaff.length / 6));
-
-    if (requestedOff.length > maxAllowedOff) {
-      warnings.push({
-        date,
-        shift: "AM",
-        needsManagerAction: true,
-        message: managerActionWarning(
-          date,
-          "AM",
-          requestedOff.length,
-          maxAllowedOff,
-        ),
-      });
-    }
-
-    // 2. 再按類別（長工 -> 半長工 -> 兼職）排更，遵守每週日數及工時上限
     const assignedToday = new Set<string>();
     const sortedEmployees = [...input.employees].sort((a, b) => {
       const catDiff =
@@ -99,20 +78,6 @@ export function buildWeekSchedule(
           timeSlot: cfg.slots[0],
         });
         assignedToday.add(emp.name);
-      }
-    }
-
-    // 3. 按更表底部六大時段核對在崗人數，唔夠就出警告
-    const dayAssignments = assignments.filter((a) => a.date === date);
-    for (const period of SERVICE_PERIODS) {
-      const required = requiredPeriodHeadcount(date, period);
-      const actual = countStaffInPeriod(dayAssignments, period);
-      if (actual < required) {
-        warnings.push({
-          date,
-          shift: period.id === "opening" || period.id === "breakfast" ? "AM" : "PM",
-          message: periodCoverageWarningMessage(date, period.label, actual, required),
-        });
       }
     }
   }
@@ -150,8 +115,151 @@ export function buildWeekSchedule(
       dailyHours,
       employeeHours,
     },
-    warnings,
+    warnings: evaluateRosterWarnings(days, input.employees, assignments),
   };
+}
+
+export function isIntakeNote(warning: RosterWarning): boolean {
+  const message = warning.message;
+  return (
+    message.startsWith("來源：") ||
+    message.includes("未設定 AI_API_KEY") ||
+    message.includes("寫入 Supabase") ||
+    message.includes("未送出外部模型")
+  );
+}
+
+export interface PeriodCount {
+  id: ServicePeriodId;
+  label: string;
+  shortLabel: string;
+  actual: number;
+  required: number;
+  ok: boolean;
+}
+
+export interface LeaveCount {
+  wh: number;
+  sh: number;
+  salariedLeave: number;
+  maxAllowedOff: number;
+  excess: boolean;
+}
+
+export interface DayCoverage {
+  date: string;
+  periods: PeriodCount[];
+  leave: LeaveCount;
+}
+
+function isWorkingOnDate(
+  employeeName: string,
+  date: string,
+  assignments: readonly Assignment[],
+): boolean {
+  return assignments.some((item) => item.employee === employeeName && item.date === date);
+}
+
+export function countLeaveOnDate(
+  date: string,
+  employees: readonly EmployeeAvailability[],
+  assignments: readonly Assignment[],
+): LeaveCount {
+  const rostered = employees.filter((emp) => !emp.reserve);
+  const salaried = rostered.filter((emp) => {
+    const cat = resolveCategory(emp);
+    return cat === "full_time" || cat === "half_full_time";
+  });
+  const maxAllowedOff = maxAllowedSalariedOff(salaried.length);
+  const salariedLeave = salaried.filter((emp) => isOnLeave(emp, date)).length;
+
+  let wh = 0;
+  let sh = 0;
+  for (const emp of rostered) {
+    if (isOnLeave(emp, date)) {
+      sh += 1;
+      continue;
+    }
+    if (!isWorkingOnDate(emp.name, date, assignments)) {
+      wh += 1;
+    }
+  }
+
+  return {
+    wh,
+    sh,
+    salariedLeave,
+    maxAllowedOff,
+    excess: salariedLeave > maxAllowedOff,
+  };
+}
+
+export function auditWeekCoverage(
+  days: string[],
+  employees: readonly EmployeeAvailability[],
+  assignments: readonly Assignment[],
+): DayCoverage[] {
+  return days.map((date) => {
+    const dayAssignments = assignments.filter((item) => item.date === date);
+    const periods: PeriodCount[] = SERVICE_PERIODS.map((period) => {
+      const required = requiredPeriodHeadcount(date, period);
+      const actual = countStaffInPeriod(dayAssignments, period);
+      return {
+        id: period.id,
+        label: period.label,
+        shortLabel: period.shortLabel,
+        actual,
+        required,
+        ok: actual >= required,
+      };
+    });
+    return {
+      date,
+      periods,
+      leave: countLeaveOnDate(date, employees, assignments),
+    };
+  });
+}
+
+/** 按現有更表重計六大時段在崗同放假超額，唔會重新排更。 */
+export function evaluateRosterWarnings(
+  days: string[],
+  employees: readonly EmployeeAvailability[],
+  assignments: readonly Assignment[],
+): RosterWarning[] {
+  const warnings: RosterWarning[] = [];
+
+  for (const day of auditWeekCoverage(days, employees, assignments)) {
+    if (day.leave.excess) {
+      warnings.push({
+        date: day.date,
+        shift: "AM",
+        needsManagerAction: true,
+        message: leaveExcessWarning(
+          day.date,
+          day.leave.salariedLeave,
+          day.leave.maxAllowedOff,
+        ),
+      });
+    }
+
+    for (const period of day.periods) {
+      if (period.ok) continue;
+      warnings.push({
+        date: day.date,
+        shift:
+          period.id === "opening" || period.id === "breakfast" ? "AM" : "PM",
+        message: periodCoverageWarningMessage(
+          day.date,
+          period.shortLabel,
+          period.actual,
+          period.required,
+        ),
+      });
+    }
+  }
+
+  return warnings;
 }
 
 export function shiftOnDate(

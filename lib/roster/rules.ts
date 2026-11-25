@@ -52,12 +52,14 @@ export const STAFF_CONFIG: Record<
 export const SHIFT_LABEL: Record<Shift, string> = {
   AM: "早更",
   PM: "下午更",
+  EVE: "晚更",
   OFF: "休息",
 };
 
 export const SHIFT_HOURS: Record<WorkingShift, { start: string; end: string }> = {
   AM: { start: "07:00", end: "17:00" },
   PM: { start: "12:00", end: "22:00" },
+  EVE: { start: "17:00", end: "22:00" },
 };
 
 const WEEKDAY_BY_JS_DAY: WeekdayKey[] = [
@@ -99,6 +101,13 @@ export function formatISODate(date: Date): string {
 /** Week starts on Sunday (JS getDay() === 0). */
 export function isWeekStartSunday(iso: string): boolean {
   return parseISODate(iso).getDay() === 0;
+}
+
+/** Snap any ISO date back to that week's Sunday. */
+export function sundayOnOrBefore(iso: string): string {
+  const date = parseISODate(iso);
+  date.setDate(date.getDate() - date.getDay());
+  return formatISODate(date);
 }
 
 /** Seven ISO dates starting from Sunday. */
@@ -150,7 +159,7 @@ export function hoursForEmployeeShift(
 }
 
 export function isOnLeave(employee: EmployeeAvailability, iso: string): boolean {
-  return employee.leave.includes(iso);
+  return (employee.leave ?? []).includes(iso);
 }
 
 export function canWork(
@@ -162,9 +171,9 @@ export function canWork(
   if (category === "part_time") {
     const allowedByDate =
       Array.isArray(employee.availableDates) && employee.availableDates.includes(iso);
-    const allowedByWeekday = (employee.available[weekdayKeyFromDate(iso)] ?? []).includes(
-      shift,
-    );
+    const dayShifts = employee.available[weekdayKeyFromDate(iso)] ?? [];
+    const allowedByWeekday =
+      dayShifts.includes(shift) || (shift === "EVE" && dayShifts.includes("PM"));
     return allowedByDate || allowedByWeekday;
   }
 
@@ -175,7 +184,7 @@ export function canWork(
   if (!dayShifts || dayShifts.length === 0) {
     return true;
   }
-  return dayShifts.includes(shift);
+  return dayShifts.includes(shift) || (shift === "EVE" && dayShifts.includes("PM"));
 }
 
 export function shiftsWorked(
@@ -194,6 +203,10 @@ export function hoursWorked(
     .reduce((sum, item) => sum + (item.hours ?? 0), 0);
 }
 
+export function maxAllowedSalariedOff(salariedCount: number): number {
+  return Math.max(1, Math.floor(salariedCount / 6));
+}
+
 export function managerActionWarning(
   iso: string,
   shift: WorkingShift,
@@ -204,22 +217,42 @@ export function managerActionWarning(
   return `${date.getMonth() + 1}/${date.getDate()} ${shift} 申請放假人數（${requestedOffCount} 人）超出限定放假人數（${maxAllowedOffCount} 人），請管理員指示！`;
 }
 
+export function leaveExcessWarning(
+  iso: string,
+  requestedOffCount: number,
+  maxAllowedOffCount: number,
+): string {
+  const date = parseISODate(iso);
+  return `${date.getMonth() + 1}/${date.getDate()} 放假超額：請假(SH) ${requestedOffCount} 人，上限 ${maxAllowedOffCount} 人，請管理員指示！`;
+}
+
 export function requiredShifts(): readonly WorkingShift[] {
   return WORKING_SHIFTS;
 }
 
+export type ServicePeriodId =
+  | "opening"
+  | "breakfast"
+  | "lunch"
+  | "tea"
+  | "dinner"
+  | "closing";
+
 export interface ServicePeriodSpec {
-  id: "opening" | "breakfast" | "lunch" | "tea" | "dinner" | "closing";
+  id: ServicePeriodId;
   label: string;
+  shortLabel: string;
   startMinutes: number;
   endMinutes: number;
   requiredByDayOfWeek: Record<number, number>; // 0=Sun ... 6=Sat
 }
 
+/** 六大營業時段。放假(WH/SH) 喺更表核數另外一欄。 */
 export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
   {
     id: "opening",
     label: "開檔(0600-0700)",
+    shortLabel: "開檔",
     startMinutes: 6 * 60,
     endMinutes: 7 * 60,
     requiredByDayOfWeek: { 0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2 },
@@ -227,6 +260,7 @@ export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
   {
     id: "breakfast",
     label: "早餐(0700-1130)",
+    shortLabel: "早餐",
     startMinutes: 7 * 60,
     endMinutes: 11 * 60 + 30,
     requiredByDayOfWeek: { 0: 6, 1: 6, 2: 6, 3: 6, 4: 6, 5: 6, 6: 6 },
@@ -234,13 +268,15 @@ export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
   {
     id: "lunch",
     label: "午市(1130-1400)",
+    shortLabel: "午市",
     startMinutes: 11 * 60 + 30,
     endMinutes: 14 * 60,
     requiredByDayOfWeek: { 0: 9, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 9 },
   },
   {
     id: "tea",
-    label: "茶市(1400-1700)",
+    label: "下午茶(1400-1700)",
+    shortLabel: "下午茶",
     startMinutes: 14 * 60,
     endMinutes: 17 * 60,
     requiredByDayOfWeek: { 0: 7, 1: 6, 2: 6, 3: 6, 4: 6, 5: 6, 6: 7 },
@@ -248,6 +284,7 @@ export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
   {
     id: "dinner",
     label: "晚市(1700-2200)",
+    shortLabel: "晚市",
     startMinutes: 17 * 60,
     endMinutes: 22 * 60,
     requiredByDayOfWeek: { 0: 7, 1: 7, 2: 7, 3: 7, 4: 7, 5: 8, 6: 9 },
@@ -255,11 +292,14 @@ export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
   {
     id: "closing",
     label: "收檔(2200-2300)",
+    shortLabel: "收檔",
     startMinutes: 22 * 60,
     endMinutes: 23 * 60,
     requiredByDayOfWeek: { 0: 7, 1: 6, 2: 6, 3: 7, 4: 7, 5: 8, 6: 7 },
   },
 ];
+
+export const LEAVE_AUDIT_LABEL = "放假(WH/SH)";
 
 function parseHhMmToMinutes(hhmm: string): number | null {
   const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
@@ -298,18 +338,84 @@ export function requiredPeriodHeadcount(
   return period.requiredByDayOfWeek[dow] ?? 0;
 }
 
+export function assignmentCoversPeriod(
+  assignment: Assignment,
+  period: ServicePeriodSpec,
+): boolean {
+  const win = getAssignmentWindowMinutes(assignment);
+  return win.start < period.endMinutes && win.end >= period.startMinutes;
+}
+
 export function countStaffInPeriod(
   dateAssignments: readonly Assignment[],
   period: ServicePeriodSpec,
 ): number {
-  let count = 0;
+  const names = new Set<string>();
   for (const item of dateAssignments) {
-    const win = getAssignmentWindowMinutes(item);
-    if (win.start < period.endMinutes && win.end > period.startMinutes) {
-      count += 1;
+    if (assignmentCoversPeriod(item, period)) {
+      names.add(item.employee);
     }
   }
-  return count;
+  return names.size;
+}
+
+function formatMinutesAsHhMm(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+export function formatAssignmentTimeLabel(
+  assignments: readonly Assignment[],
+): string {
+  const windows = assignments
+    .map((item) => getAssignmentWindowMinutes(item))
+    .sort((left, right) => left.start - right.start);
+  const merged: { start: number; end: number }[] = [];
+  for (const win of windows) {
+    const last = merged[merged.length - 1];
+    if (last && win.start <= last.end) {
+      last.end = Math.max(last.end, win.end);
+    } else {
+      merged.push({ start: win.start, end: win.end });
+    }
+  }
+  return merged
+    .map((win) => `${formatMinutesAsHhMm(win.start)}-${formatMinutesAsHhMm(win.end)}`)
+    .join(" / ");
+}
+
+export function periodTimeSlot(period: ServicePeriodSpec): string {
+  return `${formatMinutesAsHhMm(period.startMinutes)}-${formatMinutesAsHhMm(period.endMinutes)}`;
+}
+
+export function periodDurationHours(period: ServicePeriodSpec): number {
+  return Math.round(((period.endMinutes - period.startMinutes) / 60) * 10) / 10;
+}
+
+export function shiftForPeriod(period: ServicePeriodSpec): WorkingShift {
+  if (period.id === "opening" || period.id === "breakfast") return "AM";
+  if (period.id === "lunch" || period.id === "tea") return "PM";
+  return "EVE";
+}
+
+export function assignmentSelectedForPeriod(
+  assignment: Assignment,
+  period: ServicePeriodSpec,
+): boolean {
+  if (assignment.timeSlot === periodTimeSlot(period)) return true;
+  const win = getAssignmentWindowMinutes(assignment);
+  // Midpoint only: 08:00-18:00 must light 下午茶, not also 晚市 (17:00-22:00).
+  const mid = (period.startMinutes + period.endMinutes) / 2;
+  return win.start <= mid && mid < win.end;
+}
+
+export function coveredPeriodIds(
+  assignments: readonly Assignment[],
+): ServicePeriodId[] {
+  return SERVICE_PERIODS.filter((period) =>
+    assignments.some((item) => assignmentSelectedForPeriod(item, period)),
+  ).map((period) => period.id);
 }
 
 export function periodCoverageWarningMessage(
@@ -319,5 +425,5 @@ export function periodCoverageWarningMessage(
   required: number,
 ): string {
   const date = parseISODate(iso);
-  return `${date.getMonth() + 1}/${date.getDate()} ${periodLabel} 在崗 ${actual} 人，少於要求 ${required} 人`;
+  return `${date.getMonth() + 1}/${date.getDate()} ${periodLabel} 唔夠人返工 ${actual}/${required}`;
 }

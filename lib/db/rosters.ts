@@ -197,7 +197,11 @@ import type {
 
   export async function updateRosterById(
     id: string,
-    patch: { parsed: ParsedAvailability; schedule: Schedule },
+    patch: {
+      parsed: ParsedAvailability;
+      schedule: Schedule;
+      warnings?: RosterWarning[];
+    },
   ): Promise<WeekRoster | null> {
     const client = getSupabaseClient();
     if (!client) {
@@ -217,6 +221,7 @@ import type {
         body: JSON.stringify({
           parsed: patch.parsed,
           schedule: patch.schedule,
+          ...(patch.warnings ? { warnings: patch.warnings } : {}),
         }),
       },
     );

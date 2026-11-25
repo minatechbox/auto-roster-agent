@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { updateRosterById } from "@/lib/db/rosters";
-import type { ParsedAvailability, Schedule } from "@/lib/types";
+import type { ParsedAvailability, RosterWarning, Schedule } from "@/lib/types";
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -14,9 +14,17 @@ export async function PATCH(
     return NextResponse.json({ error: "無效的更表 ID 格式。" }, { status: 400 });
   }
 
-  let body: { parsed?: ParsedAvailability; schedule?: Schedule };
+  let body: {
+    parsed?: ParsedAvailability;
+    schedule?: Schedule;
+    warnings?: RosterWarning[];
+  };
   try {
-    body = (await req.json()) as { parsed?: ParsedAvailability; schedule?: Schedule };
+    body = (await req.json()) as {
+      parsed?: ParsedAvailability;
+      schedule?: Schedule;
+      warnings?: RosterWarning[];
+    };
   } catch {
     return NextResponse.json({ error: "請求主體必須為合法 JSON。" }, { status: 400 });
   }
@@ -29,6 +37,7 @@ export async function PATCH(
     const updated = await updateRosterById(id, {
       parsed: body.parsed,
       schedule: body.schedule,
+      warnings: body.warnings,
     });
     if (!updated) {
       return NextResponse.json({ error: "找不到對應的更表紀錄。" }, { status: 404 });

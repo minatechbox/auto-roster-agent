@@ -1,9 +1,9 @@
 /** Working shifts plus an explicit rest cell. */
-export const SHIFTS = ["AM", "PM", "OFF"] as const;
+export const SHIFTS = ["AM", "PM", "EVE", "OFF"] as const;
 export type Shift = (typeof SHIFTS)[number];
 
 /** Shifts that require coverage. OFF is the absence of an assignment. */
-export const WORKING_SHIFTS = ["AM", "PM"] as const;
+export const WORKING_SHIFTS = ["AM", "PM", "EVE"] as const;
 export type WorkingShift = (typeof WORKING_SHIFTS)[number];
 
 /** Week starts on Sunday (Day 1) and ends on Saturday (Day 7). */
