@@ -9,14 +9,26 @@ import {
   type WorkingShift,
 } from "@/lib/types";
 import {
+  SERVICE_PERIODS,
   STAFF_CONFIG,
-  formatWeekRange,
+  coveredPeriodIds,
+  formatAssignmentTimeLabel,
   hoursForEmployeeShift,
+  periodDurationHours,
+  periodTimeSlot,
   resolveCategory,
+  shiftForPeriod,
+  sundayOnOrBefore,
   weekDates,
   weekEndDate,
 } from "@/lib/roster/rules";
-import { summarizeSchedule } from "@/lib/roster/schedule";
+import type { ServicePeriodId } from "@/lib/roster/rules";
+import {
+  auditWeekCoverage,
+  evaluateRosterWarnings,
+  isIntakeNote,
+  summarizeSchedule,
+} from "@/lib/roster/schedule";
 
 interface RosterApiResponse {
   rosters?: WeekRoster[];
@@ -42,7 +54,7 @@ interface SaveDayResponse {
   error?: string;
 }
 
-type DayDuty = "AM" | "PM" | "leave" | "OFF";
+type DayDuty = "AM" | "PM" | "EVE" | "leave" | "OFF";
 
 const SAMPLE_TEXT = `Superme Cafe 報更
 Jamie Cole 6000 1001：星期一至五 AM/PM 都可以，星期六 AM，星期日只可早更，11/25 請假
@@ -86,42 +98,95 @@ function formatDayHeader(dateStr: string): { top: string; sub: string } {
   return { top: `週${weekday}`, sub: `${mm}/${dd}` };
 }
 
-const DUTY_OPTIONS: { id: DayDuty; label: string }[] = [
-  { id: "AM", label: "早更" },
-  { id: "PM", label: "下午更" },
-  { id: "leave", label: "請假" },
-  { id: "OFF", label: "休息" },
-];
+const CHIP_SIZE =
+  "inline-flex h-7 w-full items-center justify-center rounded px-0.5 text-[10px] font-medium leading-none";
+
+function chipClass(on: boolean, tone: "work" | "leave" | "off" = "work"): string {
+  if (on && tone === "leave") return `${CHIP_SIZE} bg-rose-600 text-white`;
+  if (on && tone === "off") return `${CHIP_SIZE} bg-zinc-700 text-white`;
+  if (on) return `${CHIP_SIZE} bg-indigo-600 text-white`;
+  return `${CHIP_SIZE} bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700`;
+}
+
+const DEMO_RANK: Record<string, string> = {
+  "Jamie Cole": "SM",
+  "Noah Blake": "M",
+  "Casey Quinn": "AM",
+  "Riley Shaw": "S",
+  "Avery Kim": "S",
+  "Jordan Hale": "W",
+  "Morgan Ellis": "WH",
+  "Taylor Brooks": "S",
+  "Parker Nguyen": "W",
+  "Quinn Adler": "WH",
+  "Reese Dalton": "W",
+  "Skyler Ortiz": "WH",
+  "Hayden Cho": "W",
+  "Rowan Patel": "WH",
+};
+
+function roleParts(emp: EmployeeAvailability | undefined): { rank: string; kind: string } {
+  return {
+    rank: DEMO_RANK[emp?.name ?? ""] ?? "S",
+    kind: emp && resolveCategory(emp) === "part_time" ? "P.T" : "F.T",
+  };
+}
+
+function formatHours(hours: number): string {
+  const rounded = Math.round(hours * 10) / 10;
+  return `${rounded}h`;
+}
+
+function PeriodRatio({
+  periods,
+}: {
+  periods: { id: string; actual: number; required: number; ok: boolean }[] | undefined;
+}) {
+  return (
+    <>
+      {SERVICE_PERIODS.map((period, index) => {
+        const cell = periods?.find((item) => item.id === period.id);
+        const short = cell ? !cell.ok : false;
+        return (
+          <span key={period.id} className={short ? "font-bold text-rose-600" : undefined}>
+            {index > 0 ? "／" : ""}
+            {period.shortLabel}({cell ? `${cell.actual}/${cell.required}` : "—"})
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+function slotStartMinutes(slot: string): number {
+  const start = slot.split("-")[0] ?? "";
+  const [hh, mm] = start.split(":").map((part) => Number(part));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return 0;
+  return hh * 60 + mm;
+}
 
 function slotForEmployee(emp: EmployeeAvailability, shift: WorkingShift): string {
-  const cfg = STAFF_CONFIG[resolveCategory(emp)];
-  if (shift === "PM" && cfg.slots.length > 1) {
-    return cfg.slots[cfg.slots.length - 1] ?? cfg.slots[0] ?? "";
+  const slots = STAFF_CONFIG[resolveCategory(emp)].slots;
+  if (slots.length === 0) return "";
+  if (shift === "AM") {
+    return slots.find((slot) => slotStartMinutes(slot) < 11 * 60) ?? slots[0] ?? "";
   }
-  return cfg.slots[0] ?? "";
-}
-
-function currentDuty(
-  employee: string,
-  day: string,
-  rosterAssignments: Assignment[],
-  leaveByEmployee: Map<string, Set<string>>,
-): DayDuty {
-  const matched = rosterAssignments.filter(
-    (a) => a.employee === employee && a.date === day,
+  if (shift === "EVE") {
+    return (
+      [...slots].reverse().find((slot) => slotStartMinutes(slot) >= 17 * 60) ??
+      slots[slots.length - 1] ??
+      ""
+    );
+  }
+  return (
+    slots.find((slot) => {
+      const start = slotStartMinutes(slot);
+      return start >= 11 * 60 && start < 17 * 60;
+    }) ??
+    slots.find((slot) => slotStartMinutes(slot) >= 12 * 60) ??
+    slots[slots.length - 1] ??
+    ""
   );
-  if (matched.length > 0) {
-    const onlyPm = matched.every((m) => m.shift === "PM");
-    return onlyPm ? "PM" : "AM";
-  }
-  if (leaveByEmployee.get(employee)?.has(day)) return "leave";
-  return "OFF";
-}
-
-function nextDuty(duty: DayDuty): DayDuty {
-  const order: DayDuty[] = ["AM", "PM", "leave", "OFF"];
-  const index = order.indexOf(duty);
-  return order[(index + 1) % order.length] ?? "OFF";
 }
 
 export default function Home() {
@@ -143,11 +208,14 @@ export default function Home() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const weekStartInputRef = useRef<HTMLInputElement | null>(null);
 
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<string>("2026-11-22");
   const [savingDay, setSavingDay] = useState<boolean>(false);
+  const [excessOpen, setExcessOpen] = useState(false);
+  const excessRef = useRef<HTMLDivElement>(null);
   const rosterRef = useRef<WeekRoster | null>(null);
   const saveQueue = useRef(Promise.resolve());
 
@@ -165,6 +233,11 @@ export default function Home() {
 
       if (preferredId) {
         setSelectedId(preferredId);
+        const found = list.find((item) => item.id === preferredId);
+        if (found?.weekStart) {
+          setWeekStart(found.weekStart);
+          setSelectedDay(found.weekStart);
+        }
       } else if (list.length > 0) {
         setSelectedId((prev) =>
           prev && list.some((item) => item.id === prev) ? prev : list[0].id
@@ -188,6 +261,53 @@ export default function Home() {
       if (imagePreview) URL.revokeObjectURL(imagePreview);
     };
   }, [imagePreview]);
+
+  useEffect(() => {
+    if (!excessOpen) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!excessRef.current?.contains(event.target as Node)) setExcessOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [excessOpen]);
+
+  function handleWeekStartChange(raw: string) {
+    if (!raw) return;
+    let sunday = raw;
+    try {
+      sunday = sundayOnOrBefore(raw);
+    } catch {
+      return;
+    }
+    setWeekStart(sunday);
+    try {
+      setSelectedDay(weekDates(sunday)[0] ?? sunday);
+    } catch {
+      setSelectedDay(sunday);
+    }
+    const match = rosters.find((item) => item.weekStart === sunday);
+    setSelectedId(match?.id ?? null);
+    setFeedback(
+      match
+        ? `已轉去 ${sunday} 嗰週更表`
+        : `已轉去 ${sunday} 嗰週（暫無草稿，可按「+ Mock 草稿」）`,
+    );
+  }
+
+  function openWeekStartPicker() {
+    const input = weekStartInputRef.current;
+    if (!input) return;
+    try {
+      if (typeof input.showPicker === "function") {
+        input.showPicker();
+        return;
+      }
+    } catch {
+      /* native picker may already be open */
+    }
+    input.focus();
+    input.click();
+  }
 
   async function handleGenerateFromDb() {
     setGeneratingDb(true);
@@ -415,20 +535,20 @@ export default function Home() {
   }
 
   const selectedRoster =
-    rosters.find((item) => item.id && item.id === selectedId) ?? rosters[0] ?? null;
+    rosters.find((item) => item.id === selectedId && item.weekStart === weekStart) ??
+    rosters.find((item) => item.weekStart === weekStart) ??
+    null;
   rosterRef.current = selectedRoster;
 
   const days = selectedRoster?.schedule?.days ?? [];
   const assignments = selectedRoster?.schedule?.assignments ?? [];
   const dailyHours = selectedRoster?.schedule?.dailyHours ?? [];
   const employeeHours = selectedRoster?.schedule?.employeeHours ?? [];
-  let weekDays = days;
-  if (weekDays.length !== 7) {
-    try {
-      weekDays = weekDates(selectedRoster?.weekStart ?? weekStart);
-    } catch {
-      weekDays = days;
-    }
+  let weekDays: string[] = [];
+  try {
+    weekDays = weekDates(weekStart);
+  } catch {
+    weekDays = days;
   }
   const activeDay = weekDays.includes(selectedDay) ? selectedDay : (weekDays[0] ?? "");
 
@@ -444,17 +564,82 @@ export default function Home() {
       orderedEmployees.push(emp.name);
     }
   }
+  const reserveNameSet = new Set(reserveEmployees.map((emp) => emp.name));
   for (const a of assignments) {
-    if (a.employee && !seenEmp.has(a.employee)) {
-      seenEmp.add(a.employee);
-      orderedEmployees.push(a.employee);
+    if (!a.employee || seenEmp.has(a.employee) || reserveNameSet.has(a.employee)) {
+      continue;
     }
+    seenEmp.add(a.employee);
+    orderedEmployees.push(a.employee);
   }
 
   const leaveMap = new Map<string, Set<string>>();
+  const employeeByName = new Map<string, EmployeeAvailability>();
   for (const emp of selectedRoster?.parsed?.employees ?? []) {
     leaveMap.set(emp.name, new Set(emp.leave ?? []));
+    employeeByName.set(emp.name, emp);
   }
+
+  function dayKind(employee: string, day: string): "work" | "leave" | "off" {
+    if (assignments.some((item) => item.employee === employee && item.date === day)) {
+      return "work";
+    }
+    if (leaveMap.get(employee)?.has(day)) return "leave";
+    return "off";
+  }
+
+  function dutyCode(employee: string, day: string, kind: "leave" | "off"): string {
+    const prefix = kind === "leave" ? "W" : "AL";
+    const index = weekDays.filter((item) => dayKind(employee, item) === kind).indexOf(day);
+    return index >= 0 ? `${prefix}${index + 1}` : prefix;
+  }
+
+  function workDayCount(employee: string): number {
+    return weekDays.filter((day) => dayKind(employee, day) === "work").length;
+  }
+
+  function splitDayHours(day: string): {
+    regular: number;
+    overtime: number;
+    partTime: number;
+    total: number;
+  } {
+    const names = new Set(
+      assignments.filter((item) => item.date === day).map((item) => item.employee),
+    );
+    let regular = 0;
+    let overtime = 0;
+    let partTime = 0;
+    for (const name of names) {
+      const hours = assignments
+        .filter((item) => item.employee === name && item.date === day)
+        .reduce((sum, item) => sum + (item.hours ?? 0), 0);
+      const category = resolveCategory(
+        employeeByName.get(name) ?? {
+          name,
+          department: "Superme Cafe",
+          leave: [],
+          available: {},
+        },
+      );
+      if (category === "part_time") {
+        partTime += hours;
+        continue;
+      }
+      const cap = category === "half_full_time" ? 5 : 10;
+      regular += Math.min(hours, cap);
+      overtime += Math.max(0, hours - cap);
+    }
+    return { regular, overtime, partTime, total: regular + overtime + partTime };
+  }
+
+  const daySplits = weekDays.map((day) => splitDayHours(day));
+  const hourSummaryRows: { key: string; label: string; values: number[] }[] = [
+    { key: "ft", label: "長工工時", values: daySplits.map((item) => item.regular) },
+    { key: "ot", label: "長工加班工時", values: daySplits.map((item) => item.overtime) },
+    { key: "pt", label: "兼職工時", values: daySplits.map((item) => item.partTime) },
+    { key: "all", label: "每日總工時", values: daySplits.map((item) => item.total) },
+  ];
 
   const empHoursMap = new Map<string, { totalHours: number; shiftsCount: number }>();
   for (const eh of employeeHours) {
@@ -471,6 +656,16 @@ export default function Home() {
       totalHours: dh.totalHours,
     });
   }
+
+  const coverageDays = selectedRoster
+    ? auditWeekCoverage(
+        weekDays,
+        selectedRoster.parsed?.employees ?? [],
+        assignments,
+      )
+    : [];
+  const dayCoverage =
+    coverageDays.find((item) => item.date === activeDay) ?? null;
 
   async function handleApplyDuty(employeeName: string, day: string, duty: DayDuty) {
     const selectedRoster = rosterRef.current;
@@ -509,7 +704,7 @@ export default function Home() {
     let nextAssignments = selectedRoster.schedule.assignments.filter(
       (a) => !(a.employee === employeeName && a.date === day),
     );
-    if (duty === "AM" || duty === "PM") {
+    if (duty === "AM" || duty === "PM" || duty === "EVE") {
       nextAssignments = [
         ...nextAssignments,
         {
@@ -530,6 +725,10 @@ export default function Home() {
       nextAssignments,
       employeeNames,
     );
+    const nextWarnings = [
+      ...(selectedRoster.warnings ?? []).filter(isIntakeNote),
+      ...evaluateRosterWarnings(scheduleDays, employees, nextAssignments),
+    ];
 
     const nextRoster: WeekRoster = {
       ...selectedRoster,
@@ -541,6 +740,7 @@ export default function Home() {
         dailyHours: nextDaily,
         employeeHours: nextEmpHours,
       },
+      warnings: nextWarnings,
     };
 
     const rosterId = selectedRoster.id;
@@ -565,6 +765,135 @@ export default function Home() {
           body: JSON.stringify({
             parsed: latest.parsed,
             schedule: latest.schedule,
+            warnings: latest.warnings,
+          }),
+        });
+        const data = (await res.json()) as SaveDayResponse;
+        if (!res.ok) {
+          throw new Error(data.error || `儲存當日更表失敗（HTTP ${res.status}）`);
+        }
+      })
+      .catch((err: unknown) => {
+        setErrorMsg(err instanceof Error ? err.message : "儲存當日更表時發生錯誤");
+      })
+      .finally(() => {
+        setSavingDay(false);
+      });
+  }
+
+  async function handleTogglePeriod(
+    employeeName: string,
+    day: string,
+    periodId: ServicePeriodId,
+  ) {
+    const selectedRoster = rosterRef.current;
+    if (!selectedRoster) return;
+
+    const existing =
+      selectedRoster.parsed.employees.find((e) => e.name === employeeName) ??
+      ({
+        name: employeeName,
+        department: selectedRoster.department || "Superme Cafe",
+        leave: [],
+        available: {},
+      } satisfies EmployeeAvailability);
+
+    const dayAssignments = selectedRoster.schedule.assignments.filter(
+      (item) => item.employee === employeeName && item.date === day,
+    );
+    const covered = new Set(coveredPeriodIds(dayAssignments));
+    if (covered.has(periodId)) {
+      covered.delete(periodId);
+    } else {
+      covered.add(periodId);
+    }
+
+    const employees = selectedRoster.parsed.employees.some((e) => e.name === employeeName)
+      ? selectedRoster.parsed.employees.map((e) => {
+          if (e.name !== employeeName) {
+            return { ...e, leave: [...(e.leave ?? [])] };
+          }
+          const leave = (e.leave ?? []).filter((d) => d !== day);
+          return { ...e, leave };
+        })
+      : [
+          ...selectedRoster.parsed.employees.map((e) => ({
+            ...e,
+            leave: [...(e.leave ?? [])],
+          })),
+          { ...existing, leave: [...(existing.leave ?? [])].filter((d) => d !== day) },
+        ];
+
+    const nextEmp = employees.find((e) => e.name === employeeName) ?? existing;
+    let nextAssignments = selectedRoster.schedule.assignments.filter(
+      (item) => !(item.employee === employeeName && item.date === day),
+    );
+    for (const period of SERVICE_PERIODS) {
+      if (!covered.has(period.id)) continue;
+      nextAssignments = [
+        ...nextAssignments,
+        {
+          date: day,
+          shift: shiftForPeriod(period),
+          employee: employeeName,
+          department: nextEmp.department || selectedRoster.department || "Superme Cafe",
+          hours: periodDurationHours(period),
+          timeSlot: periodTimeSlot(period),
+        },
+      ];
+    }
+
+    const scheduleDays = weekDays.length === 7 ? weekDays : selectedRoster.schedule.days;
+    const employeeNames = [...new Set(employees.map((e) => e.name))];
+    const { dailyHours: nextDaily, employeeHours: nextEmpHours } = summarizeSchedule(
+      scheduleDays,
+      nextAssignments,
+      employeeNames,
+    );
+    const nextWarnings = [
+      ...(selectedRoster.warnings ?? []).filter(isIntakeNote),
+      ...evaluateRosterWarnings(scheduleDays, employees, nextAssignments),
+    ];
+
+    const nextRoster: WeekRoster = {
+      ...selectedRoster,
+      parsed: { employees },
+      schedule: {
+        ...selectedRoster.schedule,
+        days: scheduleDays,
+        assignments: nextAssignments,
+        dailyHours: nextDaily,
+        employeeHours: nextEmpHours,
+      },
+      warnings: nextWarnings,
+    };
+
+    const rosterId = selectedRoster.id;
+    rosterRef.current = nextRoster;
+    setRosters((prev) =>
+      prev.map((item) => (item.id === rosterId ? nextRoster : item)),
+    );
+    setSelectedDay(day);
+    const period = SERVICE_PERIODS.find((item) => item.id === periodId);
+    setFeedback(
+      `已改 ${formatDayHeader(day).top} ${formatDayHeader(day).sub} · ${employeeName} · ${period?.shortLabel ?? periodId}`,
+    );
+
+    if (!rosterId) return;
+
+    setSavingDay(true);
+    setErrorMsg(null);
+    saveQueue.current = saveQueue.current
+      .then(async () => {
+        const latest = rosterRef.current;
+        if (!latest?.id) return;
+        const res = await fetch(`/api/rosters/${encodeURIComponent(latest.id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            parsed: latest.parsed,
+            schedule: latest.schedule,
+            warnings: latest.warnings,
           }),
         });
         const data = (await res.json()) as SaveDayResponse;
@@ -589,18 +918,17 @@ export default function Home() {
       (a) => a.employee === employee && a.date === day
     );
     if (matched.length > 0) {
-      const slots = matched.map((m) => m.timeSlot || m.shift).join(" / ");
       const totalH = matched.reduce((sum, m) => sum + (m.hours ?? 0), 0);
       return {
-        label: slots,
+        label: formatAssignmentTimeLabel(matched),
         sub: totalH > 0 ? `${totalH}h` : undefined,
         kind: "work",
       };
     }
     if (leaveMap.get(employee)?.has(day)) {
-      return { label: "請假", kind: "leave" };
+      return { label: dutyCode(employee, day, "leave"), kind: "leave" };
     }
-    return { label: "OFF", kind: "off" };
+    return { label: dutyCode(employee, day, "off"), kind: "off" };
   }
 
   return (
@@ -649,7 +977,7 @@ export default function Home() {
               Superme Cafe · 自動排班控制台
             </h1>
             <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              週日開週制 · 員工橫向更表、工時核算、六大時段核數及放假超額提示。
+              週日開週制 · 員工橫向更表、工時核算、六大時段核數（開檔／早餐／午市／下午茶／晚市／收檔）及放假(WH/SH)超額提示。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
@@ -680,8 +1008,7 @@ export default function Home() {
           </div>
         </header>
 
-        {/* 三種收資料渠道：WhatsApp / WeChat / 日曆相片 */}
-        <section className="no-print mt-5 rounded-xl border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+        <section className="no-print mt-4 rounded-xl border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label
@@ -690,13 +1017,25 @@ export default function Home() {
               >
                 每週起始日（星期日）
               </label>
-              <input
-                id="weekStart"
-                type="date"
-                value={weekStart}
-                onChange={(e) => setWeekStart(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
-              />
+              <div className="relative mt-1">
+                <input
+                  ref={weekStartInputRef}
+                  id="weekStart"
+                  type="date"
+                  value={weekStart}
+                  onChange={(e) => handleWeekStartChange(e.target.value)}
+                  onClick={openWeekStartPicker}
+                  className="w-full cursor-pointer rounded-lg border border-zinc-300 bg-white px-3 py-1.5 pr-10 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                />
+                <button
+                  type="button"
+                  onClick={openWeekStartPicker}
+                  className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  aria-label="打開月曆揀日期"
+                >
+                  📅
+                </button>
+              </div>
             </div>
             <div>
               <label
@@ -715,8 +1054,124 @@ export default function Home() {
               />
             </div>
           </div>
+          <div className="relative mt-3" ref={excessRef}>
+            <span
+              id="leaveExcessLabel"
+              className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
+            >
+              放假超額提示
+            </span>
+            <button
+              type="button"
+              aria-labelledby="leaveExcessLabel"
+              aria-expanded={excessOpen}
+              onClick={() => setExcessOpen((open) => !open)}
+              className="mt-1 flex w-full items-start justify-between gap-3 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-left text-sm dark:border-zinc-700 dark:bg-zinc-950"
+            >
+              <span className="min-w-0">
+                <span
+                  className={`block ${
+                    dayCoverage?.leave.excess ? "font-bold text-rose-600" : "text-zinc-500"
+                  }`}
+                >
+                  {dayCoverage?.leave.excess
+                    ? `${formatDayHeader(activeDay).top} ${formatDayHeader(activeDay).sub} 請假 ${dayCoverage.leave.salariedLeave}/${dayCoverage.leave.maxAllowedOff}，請管理員指示`
+                    : coverageDays.some((day) => day.leave.excess)
+                      ? "當日沒有放假超額"
+                      : "本週沒有放假超額"}
+                </span>
+                <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700 dark:text-zinc-200">
+                  <PeriodRatio periods={dayCoverage?.periods} />
+                </span>
+              </span>
+              <span className="pt-1 text-xs text-zinc-500" aria-hidden>
+                ▾
+              </span>
+            </button>
+            {excessOpen ? (
+              <ul className="absolute z-20 mt-1 max-h-72 w-full overflow-auto rounded-lg border border-zinc-300 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-950">
+                {coverageDays.length === 0 ? (
+                  <li className="px-3 py-2 text-sm text-zinc-500">本週沒有放假超額</li>
+                ) : (
+                  coverageDays.map((day) => {
+                    const header = formatDayHeader(day.date);
+                    const on = day.date === activeDay;
+                    return (
+                      <li key={day.date}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedDay(day.date);
+                            setExcessOpen(false);
+                          }}
+                          className={`block w-full px-3 py-1.5 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+                            on ? "bg-indigo-50 dark:bg-indigo-950/40" : ""
+                          }`}
+                        >
+                          <span
+                            className={`block ${day.leave.excess ? "font-bold text-rose-600" : "text-zinc-500"}`}
+                          >
+                            {day.leave.excess
+                              ? `${header.top} ${header.sub} 請假 ${day.leave.salariedLeave}/${day.leave.maxAllowedOff}，請管理員指示`
+                              : `${header.top} ${header.sub} 沒有放假超額`}
+                          </span>
+                          <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700 dark:text-zinc-200">
+                            <PeriodRatio periods={day.periods} />
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })
+                )}
+              </ul>
+            ) : null}
+          </div>
+        </section>
 
-          <div className="mt-4 flex flex-wrap gap-1.5 rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800">
+        {weekDays.length === 7 ? (
+          <div className="no-print mt-4 grid grid-cols-7 gap-1">
+            {weekDays.map((day) => {
+              const h = formatDayHeader(day);
+              const on = day === activeDay;
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => setSelectedDay(day)}
+                  className={`rounded-lg border px-1 py-2 text-center text-xs font-semibold ${
+                    on
+                      ? "border-indigo-600 bg-indigo-50 text-indigo-950 dark:bg-indigo-950/40 dark:text-indigo-100"
+                      : "border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                  }`}
+                >
+                  <div>{h.top}</div>
+                  <div className={`font-mono text-[11px] font-normal ${on ? "text-indigo-700 dark:text-indigo-200" : "text-zinc-500"}`}>
+                    {h.sub}
+                  </div>
+                  {(() => {
+                    const names =
+                      coverageDays
+                        .find((item) => item.date === day)
+                        ?.periods.filter((period) => !period.ok)
+                        .map((period) => period.shortLabel) ?? [];
+                    if (names.length === 0) return null;
+                    return (
+                      <div className="mt-0.5 text-[10px] font-bold leading-tight text-rose-600">
+                        唔夠人 {names.join("／")}
+                      </div>
+                    );
+                  })()}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+
+        <details className="no-print mt-4 rounded-xl border border-zinc-200 bg-white px-4 py-2 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <summary className="cursor-pointer text-sm font-medium text-zinc-700 dark:text-zinc-200">
+            收更資料 · WhatsApp／WeChat／相片
+          </summary>
+          <div className="mt-3 flex flex-wrap gap-1.5 rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800">
             {(
               [
                 { id: "whatsapp", label: "WhatsApp 文字" },
@@ -857,7 +1312,7 @@ export default function Home() {
               ) : null}
             </form>
           ) : null}
-        </section>
+        </details>
 
         {feedback && (
           <div className="no-print mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
@@ -871,99 +1326,82 @@ export default function Home() {
           </div>
         )}
 
-        {/* 連續 7 日：撳入去改當日更表 */}
+
         <section className="no-print mt-5" translate="no">
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-              本週 7 日 · 撳入去改
-              {weekDays.length === 7 ? ` · ${formatWeekRange(weekDays[0])}` : ""}
+              {formatDayHeader(activeDay).top} {formatDayHeader(activeDay).sub} · 當日員工 · 撳掣改更
             </h2>
             {savingDay ? (
               <span className="text-xs text-zinc-500">儲存中...</span>
             ) : null}
           </div>
-          {loadingList ? (
-            <p className="text-xs text-zinc-500">正在讀取本週更表...</p>
-          ) : (
-            <>
-              <div className="grid grid-cols-7 gap-1.5 sm:gap-2">
-                {weekDays.map((day) => {
-                  const h = formatDayHeader(day);
-                  const isActive = day === activeDay;
-                  const dh = dailyHoursMap.get(day);
-                  return (
-                    <button
-                      key={day}
-                      type="button"
-                      onClick={() => setSelectedDay(day)}
-                      className={`rounded-lg border px-1 py-2 text-center transition sm:px-2 ${
-                        isActive
-                          ? "border-indigo-600 bg-indigo-50 ring-1 ring-indigo-600 dark:border-indigo-400 dark:bg-indigo-950/50"
-                          : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:bg-zinc-800"
-                      }`}
-                    >
-                      <div className="text-xs font-semibold sm:text-sm">{h.top}</div>
-                      <div className="font-mono text-[11px] text-zinc-500 dark:text-zinc-400">
-                        {h.sub}
-                      </div>
-                      <div className="mt-1 text-[10px] text-zinc-400">
-                        {dh ? `${dh.headcount}人` : "—"}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-
               {!selectedRoster ? (
                 <p className="mt-3 text-xs text-zinc-500">
                   暫無本週更表，請按右上角「+ Mock 草稿」後再改各日。
                 </p>
               ) : activeDay ? (
-                <div className="mt-3 rounded-xl border border-indigo-200 bg-white p-3 dark:border-indigo-900 dark:bg-zinc-900">
-                  <p className="mb-2 text-xs font-medium text-zinc-600 dark:text-zinc-300">
-                    {formatDayHeader(activeDay).top} {formatDayHeader(activeDay).sub}{" "}
-                    · 揀早更／下午更／請假／休息
-                  </p>
-                  <ul className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                <div className="mt-1">
+                  <ul className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
                     {[
                       ...orderedEmployees.map((name) => ({ name, reserve: false })),
                       ...reserveEmployees.map((emp) => ({ name: emp.name, reserve: true })),
                     ].map((row) => {
-                      const duty = currentDuty(row.name, activeDay, assignments, leaveMap);
+                      const dayAssignments = assignments.filter(
+                        (item) => item.employee === row.name && item.date === activeDay,
+                      );
+                      const covered = new Set(coveredPeriodIds(dayAssignments));
+                      const onLeave = leaveMap.get(row.name)?.has(activeDay) ?? false;
+                      const onRest = !onLeave && covered.size === 0;
+                      const leaveLabel = onLeave ? dutyCode(row.name, activeDay, "leave") : "W";
+                      const restLabel = onRest ? dutyCode(row.name, activeDay, "off") : "AL";
                       return (
                         <li
                           key={row.name}
-                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-200 px-2.5 py-2 dark:border-zinc-700"
+                          className="grid grid-cols-[7.5rem_1fr] items-center gap-2 border-b border-zinc-100 py-1.5 dark:border-zinc-800"
                         >
-                          <span className="text-sm font-medium">
+                          <span className="truncate text-sm font-medium">
                             {row.name}
                             {row.reserve ? (
-                              <span className="ml-1.5 text-[10px] font-normal text-zinc-400">
-                                後補
+                              <span className="ml-1 text-[10px] font-normal text-zinc-400">
+                                後備
                               </span>
                             ) : null}
                           </span>
-                          <div className="flex flex-wrap gap-1">
-                            {DUTY_OPTIONS.map((opt) => (
-                              <button
-                                key={opt.id}
-                                type="button"
-                                onClick={() =>
-                                  void handleApplyDuty(row.name, activeDay, opt.id)
-                                }
-                                className={`rounded-md px-2 py-1 text-[11px] font-medium transition disabled:opacity-50 ${
-                                  duty === opt.id
-                                    ? opt.id === "leave"
-                                      ? "bg-rose-600 text-white"
-                                      : opt.id === "OFF"
-                                        ? "bg-zinc-700 text-white"
-                                        : "bg-indigo-600 text-white"
-                                    : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
-                                }`}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
+                          <div className="grid grid-cols-8 gap-1">
+                            {SERVICE_PERIODS.map((period) => {
+                              const on = covered.has(period.id);
+                              return (
+                                <button
+                                  key={`${row.name}-${activeDay}-${period.id}`}
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    void handleTogglePeriod(row.name, activeDay, period.id);
+                                  }}
+                                  className={chipClass(on)}
+                                >
+                                  {period.shortLabel}
+                                </button>
+                              );
+                            })}
+                            <button
+                              type="button"
+                              title={onLeave ? `第${leaveLabel.slice(1)}天假` : "請假"}
+                              onClick={() => void handleApplyDuty(row.name, activeDay, "leave")}
+                              className={chipClass(onLeave, "leave")}
+                            >
+                              {leaveLabel}
+                            </button>
+                            <button
+                              type="button"
+                              title={onRest ? `第${restLabel.slice(2)}天` : "休息"}
+                              onClick={() => void handleApplyDuty(row.name, activeDay, "OFF")}
+                              className={chipClass(onRest, "off")}
+                            >
+                              {restLabel}
+                            </button>
                           </div>
                         </li>
                       );
@@ -971,12 +1409,16 @@ export default function Home() {
                   </ul>
                 </div>
               ) : null}
-            </>
-          )}
         </section>
 
         {/* 主更表 Matrix 視圖（列印時保留呢一區） */}
-        {selectedRoster && (
+        {!selectedRoster ? (
+          <p className="mt-5 text-xs text-zinc-500">
+            暫無本週更表，請按右上角「+ Mock 草稿」後再睇週更表。
+          </p>
+        ) : null}
+
+        {selectedRoster ? (
           <section className="print-area mt-4 space-y-5 rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
             <div className="flex flex-col justify-between gap-3 border-b border-zinc-200 pb-4 dark:border-zinc-800 sm:flex-row sm:items-center print:border-black print:pb-2">
               <div>
@@ -1027,13 +1469,11 @@ export default function Home() {
               </div>
             </div>
 
-            {/* 橫向一覽排更表（每位員工一行、週日至週六七欄） */}
+            {/* 橫向一覽排更表（螢幕只睇一日，列印先出全日週） */}
             <div>
               <div className="no-print mb-2 flex items-center justify-between">
                 <h3 className="text-sm font-semibold">員工週更表（一目了然）</h3>
-                <span className="text-xs text-zinc-500">
-                  撳格仔改更：早更 → 下午更 → 請假 → 休息
-                </span>
+                <span className="text-xs text-zinc-500">只供睇，無掣</span>
               </div>
 
               {weekDays.length === 0 || orderedEmployees.length === 0 ? (
@@ -1041,12 +1481,19 @@ export default function Home() {
                   暫無可顯示的員工排班資料。
                 </p>
               ) : (
-                <div className="overflow-x-auto rounded-lg border border-zinc-300 dark:border-zinc-700 print:overflow-visible print:border-none">
-                  <table className="print-table w-full min-w-[920px] border-collapse text-xs">
+                <>
+                <div className="no-print overflow-x-auto rounded-lg border border-zinc-300 dark:border-zinc-700">
+                  <table className="pointer-events-none w-full min-w-[920px] border-collapse text-xs">
                     <thead>
                       <tr className="border-b border-zinc-300 bg-zinc-100 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 print:bg-zinc-200 print:text-black">
-                        <th className="sticky left-0 z-10 w-44 border-r border-zinc-300 bg-zinc-100 px-3 py-2.5 text-left font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
-                          員工姓名
+                        <th className="sticky left-0 z-10 w-32 border-r border-zinc-300 bg-zinc-100 px-3 py-2.5 text-left font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
+                          姓名
+                        </th>
+                        <th
+                          colSpan={2}
+                          className="border-r border-zinc-300 bg-zinc-100 px-2 py-2.5 text-center font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200"
+                        >
+                          職位
                         </th>
                         {weekDays.map((day) => {
                           const h = formatDayHeader(day);
@@ -1054,25 +1501,22 @@ export default function Home() {
                           return (
                             <th
                               key={day}
-                              className={`border-r border-zinc-300 px-1 py-1 text-center font-semibold dark:border-zinc-700 ${
+                              className={`border-r border-zinc-300 px-2 py-2 text-center font-semibold dark:border-zinc-700 ${
                                 isActive ? "bg-indigo-100 dark:bg-indigo-950/60 print:bg-zinc-200" : ""
                               }`}
                             >
-                              <button
-                                type="button"
-                                onClick={() => setSelectedDay(day)}
-                                className="w-full rounded px-1 py-1 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 print:pointer-events-none"
-                              >
-                                <div>{h.top}</div>
-                                <div className="font-mono text-[11px] font-normal text-zinc-500 dark:text-zinc-400 print:text-black">
-                                  {h.sub}
-                                </div>
-                              </button>
+                              <div>{h.top}</div>
+                              <div className="font-mono text-[11px] font-normal text-zinc-500 dark:text-zinc-400 print:text-black">
+                                {h.sub}
+                              </div>
                             </th>
                           );
                         })}
-                        <th className="w-24 bg-zinc-100 px-2.5 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
+                        <th className="w-20 bg-zinc-100 px-2 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
                           本週工時
+                        </th>
+                        <th className="w-16 bg-zinc-100 px-2 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
+                          上班日數
                         </th>
                       </tr>
                     </thead>
@@ -1092,9 +1536,14 @@ export default function Home() {
                             <td className="sticky left-0 z-10 border-r border-zinc-300 bg-inherit px-3 py-2 font-semibold text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 print:text-black">
                               {emp}
                             </td>
+                            <td className="border-r border-zinc-200 px-2 py-2 text-center font-mono text-[11px] text-zinc-700 dark:border-zinc-800 dark:text-zinc-200">
+                              {roleParts(employeeByName.get(emp)).rank}
+                            </td>
+                            <td className="border-r border-zinc-300 px-2 py-2 text-center font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:text-zinc-200">
+                              {roleParts(employeeByName.get(emp)).kind}
+                            </td>
                             {weekDays.map((day) => {
                               const cell = getCellDisplay(emp, day);
-                              const duty = currentDuty(emp, day, assignments, leaveMap);
                               const isActive = day === activeDay;
                               return (
                                 <td
@@ -1103,34 +1552,25 @@ export default function Home() {
                                     isActive ? "bg-indigo-50/70 dark:bg-indigo-950/30 print:bg-transparent" : ""
                                   }`}
                                 >
-                                  <button
-                                    type="button"
-                                    title="撳一下轉：早更 → 下午更 → 請假 → 休息"
-                                    onClick={() => {
-                                      setSelectedDay(day);
-                                      void handleApplyDuty(emp, day, nextDuty(duty));
-                                    }}
-                                    className="w-full cursor-pointer print:pointer-events-none"
-                                  >
-                                    {cell.kind === "work" ? (
-                                      <div className="rounded bg-blue-50 px-1.5 py-1 font-mono text-[11px] font-medium text-blue-900 ring-1 ring-blue-200 dark:bg-blue-950/60 dark:text-blue-200 dark:ring-blue-800 print:bg-white print:text-black print:ring-0">
-                                        <div>{cell.label}</div>
-                                        {cell.sub && (
-                                          <div className="text-[10px] text-blue-600 dark:text-blue-400 print:text-black">
-                                            {cell.sub}
-                                          </div>
-                                        )}
-                                      </div>
-                                    ) : cell.kind === "leave" ? (
-                                      <span className="inline-block rounded bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700 ring-1 ring-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:ring-rose-800 print:bg-white print:font-bold print:text-black print:ring-0">
-                                        請假
-                                      </span>
-                                    ) : (
-                                      <span className="text-[11px] text-zinc-400 print:text-zinc-500">
-                                        OFF
-                                      </span>
-                                    )}
-                                  </button>
+                                  {cell.kind === "work" ? (
+                                    <div className="font-mono text-[11px] font-medium text-zinc-800 dark:text-zinc-200 print:text-black">
+                                      {cell.label}
+                                    </div>
+                                  ) : cell.kind === "leave" ? (
+                                    <span
+                                      className="text-[11px] font-medium text-rose-700 dark:text-rose-300 print:font-bold print:text-black"
+                                      title={`第${cell.label.slice(1)}天假`}
+                                    >
+                                      {cell.label}
+                                    </span>
+                                  ) : (
+                                    <span
+                                      className="text-[11px] text-zinc-400 print:text-zinc-500"
+                                      title={`第${cell.label.slice(2)}天`}
+                                    >
+                                      {cell.label}
+                                    </span>
+                                  )}
                                 </td>
                               );
                             })}
@@ -1141,46 +1581,103 @@ export default function Home() {
                                   : "text-zinc-800 dark:text-zinc-200 print:text-black"
                               }`}
                             >
-                              {stats ? `${stats.totalHours}h` : "0h"}
-                              {stats && (
-                                <div className="text-[10px] font-normal text-zinc-500 print:text-black">
-                                  ({stats.shiftsCount}日)
-                                </div>
-                              )}
+                              {stats ? formatHours(stats.totalHours) : "0h"}
+                            </td>
+                            <td className="px-2 py-2 text-center font-mono text-zinc-700 dark:text-zinc-200">
+                              {workDayCount(emp)}
                             </td>
                           </tr>
                         );
                       })}
                     </tbody>
                     <tfoot>
-                      <tr className="border-t-2 border-zinc-300 bg-zinc-100 font-semibold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200 print:text-black">
-                        <td className="sticky left-0 z-10 border-r border-zinc-300 bg-zinc-100 px-3 py-2 text-left dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
-                          每日在崗 / 總工時
-                        </td>
-                        {weekDays.map((day) => {
-                          const dh = dailyHoursMap.get(day);
-                          const isActive = day === activeDay;
-                          return (
+                      {hourSummaryRows.map((row) => (
+                        <tr
+                          key={row.key}
+                          className="border-t border-zinc-300 bg-zinc-100 font-semibold dark:border-zinc-700 dark:bg-zinc-800"
+                        >
+                          <td
+                            colSpan={3}
+                            className="sticky left-0 z-10 border-r border-zinc-300 bg-zinc-100 px-3 py-1.5 text-left dark:border-zinc-700 dark:bg-zinc-800"
+                          >
+                            {row.label}
+                          </td>
+                          {row.values.map((hours, index) => (
                             <td
-                              key={day}
-                              className={`border-r border-zinc-300 px-2 py-2 text-center font-mono text-[11px] dark:border-zinc-700 ${
-                                isActive ? "bg-indigo-100 dark:bg-indigo-950/60 print:bg-zinc-200" : ""
-                              }`}
+                              key={weekDays[index]}
+                              className="border-r border-zinc-200 px-1 py-1.5 text-center font-mono text-[11px] dark:border-zinc-800"
                             >
-                              <div>{dh ? `${dh.headcount} 人` : "0 人"}</div>
-                              <div className="text-zinc-600 dark:text-zinc-400 print:text-black">
-                                {dh ? `${dh.totalHours}h` : "0h"}
-                              </div>
+                              {formatHours(hours)}
                             </td>
-                          );
-                        })}
-                        <td className="px-2 py-2 text-center font-mono text-[11px]">
-                          {dailyHours.reduce((s, d) => s + d.totalHours, 0)}h
-                        </td>
-                      </tr>
+                          ))}
+                          <td className="px-2 py-1.5 text-center font-mono text-[11px]">
+                            {formatHours(row.values.reduce((sum, hours) => sum + hours, 0))}
+                          </td>
+                          <td className="px-2 py-1.5 text-center text-zinc-400">—</td>
+                        </tr>
+                      ))}
                     </tfoot>
                   </table>
                 </div>
+                <div className="hidden print:block overflow-x-auto rounded-lg border border-zinc-300 print:overflow-visible print:border-none">
+                  <table className="print-table w-full min-w-[920px] border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-zinc-300 bg-zinc-100 print:bg-zinc-200">
+                        <th className="px-3 py-2.5 text-left font-bold">姓名</th>
+                        <th colSpan={2} className="px-2 py-2.5 text-center font-bold">職位</th>
+                        {weekDays.map((day) => {
+                          const h = formatDayHeader(day);
+                          return (
+                            <th key={day} className="px-2 py-2 text-center font-semibold">
+                              <div>{h.top}</div>
+                              <div className="font-mono text-[11px] font-normal">{h.sub}</div>
+                            </th>
+                          );
+                        })}
+                        <th className="px-2 py-2 text-center font-bold">本週工時</th>
+                        <th className="px-2 py-2 text-center font-bold">上班日數</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {orderedEmployees.map((emp) => (
+                        <tr key={`print-${emp}`} className="border-b border-zinc-200">
+                          <td className="px-3 py-2 font-semibold">{emp}</td>
+                          <td className="px-2 py-2 text-center font-mono">{roleParts(employeeByName.get(emp)).rank}</td>
+                          <td className="px-2 py-2 text-center font-mono">{roleParts(employeeByName.get(emp)).kind}</td>
+                          {weekDays.map((day) => {
+                            const cell = getCellDisplay(emp, day);
+                            return (
+                              <td key={day} className="px-1.5 py-1.5 text-center">
+                                <div className="font-mono text-[11px]">{cell.label}</div>
+                              </td>
+                            );
+                          })}
+                          <td className="px-2 py-2 text-center font-mono font-semibold">
+                            {formatHours(empHoursMap.get(emp)?.totalHours ?? 0)}
+                          </td>
+                          <td className="px-2 py-2 text-center font-mono">{workDayCount(emp)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      {hourSummaryRows.map((row) => (
+                        <tr key={`print-${row.key}`} className="border-t border-zinc-300 font-semibold">
+                          <td colSpan={3} className="px-3 py-1.5">{row.label}</td>
+                          {row.values.map((hours, index) => (
+                            <td key={weekDays[index]} className="px-1 py-1.5 text-center font-mono">
+                              {formatHours(hours)}
+                            </td>
+                          ))}
+                          <td className="px-2 py-1.5 text-center font-mono">
+                            {formatHours(row.values.reduce((sum, hours) => sum + hours, 0))}
+                          </td>
+                          <td className="px-2 py-1.5 text-center">—</td>
+                        </tr>
+                      ))}
+                    </tfoot>
+                  </table>
+                </div>
+                </>
               )}
             </div>
 
@@ -1204,43 +1701,9 @@ export default function Home() {
                 </ul>
               )}
             </div>
-
-            {/* 警告與六大時段核數（列印時自動隱藏，保持更表乾淨） */}
-            <div className="no-print">
-              <h3 className="text-sm font-semibold">
-                排班警告與六大時段核數（{selectedRoster.warnings?.length ?? 0} 項）
-              </h3>
-              {!selectedRoster.warnings || selectedRoster.warnings.length === 0 ? (
-                <p className="mt-1.5 text-xs text-zinc-500">
-                  暫無排班警告，各時段人手達標。
-                </p>
-              ) : (
-                <ul className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
-                  {selectedRoster.warnings.map((w, i) => {
-                    const isManagerAlert = Boolean(w.needsManagerAction);
-                    return (
-                      <li
-                        key={`${w.date}-${w.shift}-${i}`}
-                        className={`rounded-md border px-3 py-2 text-xs ${
-                          isManagerAlert
-                            ? "border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950/60 dark:text-red-200"
-                            : "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
-                        }`}
-                      >
-                        {isManagerAlert && (
-                          <span className="mr-1.5 inline-block rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                            ⚠️ 請管理員指示
-                          </span>
-                        )}
-                        <span className="font-semibold">[{w.date}]</span> {w.message}
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
           </section>
-        )}
+        ) : null}
+
       </div>
     </div>
   );
