@@ -5,7 +5,6 @@ import type {
   EmployeeHourSummary,
   RosterWarning,
   ScheduleResult,
-  Shift,
   StaffCategory,
 } from "../types";
 import { WORKING_SHIFTS } from "../types";
@@ -64,7 +63,7 @@ export function buildWeekSchedule(
         const cfg = STAFF_CONFIG[cat];
         const currentDays = shiftsWorked(assignments, emp.name);
         const currentHours = hoursWorked(assignments, emp.name);
-        const addHours = hoursForEmployeeShift(emp, shift);
+        const addHours = hoursForEmployeeShift(emp);
 
         if (currentDays >= cfg.weeklyDays) continue;
         if (currentHours + addHours > cfg.weeklyHours) continue;
@@ -260,17 +259,6 @@ export function evaluateRosterWarnings(
   }
 
   return warnings;
-}
-
-export function shiftOnDate(
-  employeeName: string,
-  date: string,
-  assignments: readonly Assignment[],
-): Shift {
-  const found = assignments.find(
-    (item) => item.employee === employeeName && item.date === date,
-  );
-  return found?.shift ?? "OFF";
 }
 
 export function summarizeSchedule(

@@ -1,12 +1,10 @@
 import type {
   Assignment,
   EmployeeAvailability,
-  Shift,
   StaffCategory,
   WeekdayKey,
   WorkingShift,
 } from "../types";
-import { WORKING_SHIFTS } from "../types";
 
 export const STAFF_CONFIG: Record<
   StaffCategory,
@@ -47,13 +45,6 @@ export const STAFF_CONFIG: Record<
     monthlyRestDays: 0,
     slots: ["17:00-22:00"],
   },
-};
-
-export const SHIFT_LABEL: Record<Shift, string> = {
-  AM: "早更",
-  PM: "下午更",
-  EVE: "晚更",
-  OFF: "休息",
 };
 
 export const SHIFT_HOURS: Record<WorkingShift, { start: string; end: string }> = {
@@ -98,11 +89,6 @@ export function formatISODate(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-/** Week starts on Sunday (JS getDay() === 0). */
-export function isWeekStartSunday(iso: string): boolean {
-  return parseISODate(iso).getDay() === 0;
-}
-
 /** Snap any ISO date back to that week's Sunday. */
 export function sundayOnOrBefore(iso: string): string {
   const date = parseISODate(iso);
@@ -124,12 +110,6 @@ export function weekEndDate(weekStart: string): string {
   return weekDates(weekStart)[6];
 }
 
-export function formatWeekRange(weekStart: string): string {
-  const start = parseISODate(weekStart);
-  const end = parseISODate(weekEndDate(weekStart));
-  return `${start.getMonth() + 1}/${start.getDate()}–${end.getMonth() + 1}/${end.getDate()}`;
-}
-
 export function weekdayKeyFromDate(iso: string): WeekdayKey {
   return WEEKDAY_BY_JS_DAY[parseISODate(iso).getDay()];
 }
@@ -144,10 +124,7 @@ export function resolveCategory(employee: EmployeeAvailability): StaffCategory {
   return "full_time";
 }
 
-export function hoursForEmployeeShift(
-  employee: EmployeeAvailability,
-  _shift: WorkingShift,
-): number {
+export function hoursForEmployeeShift(employee: EmployeeAvailability): number {
   const category = resolveCategory(employee);
   if (category === "full_time") {
     return STAFF_CONFIG.full_time.dailyHours;
@@ -207,16 +184,6 @@ export function maxAllowedSalariedOff(salariedCount: number): number {
   return Math.max(1, Math.floor(salariedCount / 6));
 }
 
-export function managerActionWarning(
-  iso: string,
-  shift: WorkingShift,
-  requestedOffCount: number,
-  maxAllowedOffCount: number,
-): string {
-  const date = parseISODate(iso);
-  return `${date.getMonth() + 1}/${date.getDate()} ${shift} 申請放假人數（${requestedOffCount} 人）超出限定放假人數（${maxAllowedOffCount} 人），請管理員指示！`;
-}
-
 export function leaveExcessWarning(
   iso: string,
   requestedOffCount: number,
@@ -224,10 +191,6 @@ export function leaveExcessWarning(
 ): string {
   const date = parseISODate(iso);
   return `${date.getMonth() + 1}/${date.getDate()} 放假超額：請假(SH) ${requestedOffCount} 人，上限 ${maxAllowedOffCount} 人，請管理員指示！`;
-}
-
-export function requiredShifts(): readonly WorkingShift[] {
-  return WORKING_SHIFTS;
 }
 
 export type ServicePeriodId =
@@ -298,8 +261,6 @@ export const SERVICE_PERIODS: readonly ServicePeriodSpec[] = [
     requiredByDayOfWeek: { 0: 7, 1: 6, 2: 6, 3: 7, 4: 7, 5: 8, 6: 7 },
   },
 ];
-
-export const LEAVE_AUDIT_LABEL = "放假(WH/SH)";
 
 function parseHhMmToMinutes(hhmm: string): number | null {
   const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());

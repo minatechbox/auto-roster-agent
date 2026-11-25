@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
-  type Assignment,
   type EmployeeAvailability,
   type RosterWarning,
   type WeekRoster,
@@ -220,14 +219,13 @@ export default function Home() {
   const saveQueue = useRef(Promise.resolve());
 
   const loadRosters = useCallback(async (preferredId?: string | null) => {
-    setLoadingList(true);
-    setErrorMsg(null);
     try {
       const res = await fetch("/api/rosters", { cache: "no-store" });
       const data = (await res.json()) as RosterApiResponse;
       if (!res.ok) {
         throw new Error(data.error || `讀取更表失敗（HTTP ${res.status}）`);
       }
+      setErrorMsg(null);
       const list = Array.isArray(data.rosters) ? data.rosters : [];
       setRosters(list);
 
@@ -253,7 +251,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    void loadRosters();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void loadRosters();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadRosters]);
 
   useEffect(() => {
@@ -538,11 +542,13 @@ export default function Home() {
     rosters.find((item) => item.id === selectedId && item.weekStart === weekStart) ??
     rosters.find((item) => item.weekStart === weekStart) ??
     null;
-  rosterRef.current = selectedRoster;
+
+  useEffect(() => {
+    rosterRef.current = selectedRoster;
+  }, [selectedRoster]);
 
   const days = selectedRoster?.schedule?.days ?? [];
   const assignments = selectedRoster?.schedule?.assignments ?? [];
-  const dailyHours = selectedRoster?.schedule?.dailyHours ?? [];
   const employeeHours = selectedRoster?.schedule?.employeeHours ?? [];
   let weekDays: string[] = [];
   try {
@@ -649,14 +655,6 @@ export default function Home() {
     });
   }
 
-  const dailyHoursMap = new Map<string, { headcount: number; totalHours: number }>();
-  for (const dh of dailyHours) {
-    dailyHoursMap.set(dh.date, {
-      headcount: dh.headcount,
-      totalHours: dh.totalHours,
-    });
-  }
-
   const coverageDays = selectedRoster
     ? auditWeekCoverage(
         weekDays,
@@ -712,7 +710,7 @@ export default function Home() {
           shift: duty,
           employee: employeeName,
           department: nextEmp.department || selectedRoster.department || "Superme Cafe",
-          hours: hoursForEmployeeShift(nextEmp, duty),
+          hours: hoursForEmployeeShift(nextEmp),
           timeSlot: slotForEmployee(nextEmp, duty),
         },
       ];
@@ -983,7 +981,10 @@ export default function Home() {
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
-              onClick={() => void loadRosters(selectedId)}
+              onClick={() => {
+                setLoadingList(true);
+                void loadRosters(selectedId);
+              }}
               disabled={loadingList}
               className="rounded-lg border border-zinc-300 bg-white px-3.5 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
             >
