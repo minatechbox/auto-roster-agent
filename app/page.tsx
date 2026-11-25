@@ -396,10 +396,11 @@ export default function Home() {
     const createdId = data.roster?.id ?? null;
     await loadRosters(createdId);
     const label = channel === "wechat" ? "WeChat" : "WhatsApp";
+    const note = data.warnings?.find((item) => isIntakeNote(item))?.message;
     setFeedback(
       `已由 ${label} 文字（${data.mode ?? "text"}）建立更表草稿${
         data.persisted ? "並寫入 Supabase" : "（未寫入 Supabase）"
-      }（ID: ${createdId ?? "—"}）`
+      }（ID: ${createdId ?? "—"}）${note ? ` ${note}` : ""}`
     );
   }
 

@@ -1,6 +1,7 @@
 import type { ParsedAvailability, RosterMode } from "@/lib/types";
 import { getServerEnv } from "../env";
 import { sampleWeekParsed } from "../mock/sample-week";
+import { parseAvailabilityText } from "../roster/parse-availability-text";
 import { parseAndValidateRosterJson } from "./schema";
 
 export interface ParseOutcome {
@@ -39,7 +40,15 @@ export async function parseRosterFromText(options: {
 }): Promise<ParseOutcome> {
   const env = getServerEnv();
 
+  const local = parseAvailabilityText(options.text, options.weekStart, options.department);
   if (!env.aiApiKey) {
+    if (local.employees.length > 0) {
+      return {
+        parsed: local,
+        mode: "mock",
+        warnings: ["未設定 AI_API_KEY，已用本機規則解析文字報更。"],
+      };
+    }
     const cloned: ParsedAvailability = JSON.parse(JSON.stringify(sampleWeekParsed));
     if (options.department?.trim()) {
       for (const emp of cloned.employees) {
@@ -49,7 +58,7 @@ export async function parseRosterFromText(options: {
     return {
       parsed: cloned,
       mode: "mock",
-      warnings: ["未設定 AI_API_KEY，本次文字報更已改用內建模擬解析結果。"],
+      warnings: ["未設定 AI_API_KEY，文字入面搵唔到員工，已改用內建模擬解析結果。"],
     };
   }
 

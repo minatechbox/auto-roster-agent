@@ -158,9 +158,9 @@ export function canWork(
     return false;
   }
   const dayShifts = employee.available[weekdayKeyFromDate(iso)];
-  if (!dayShifts || dayShifts.length === 0) {
-    return true;
-  }
+  const hasPreference = Object.keys(employee.available).length > 0;
+  if (!hasPreference) return true;
+  if (!dayShifts || dayShifts.length === 0) return false;
   return dayShifts.includes(shift) || (shift === "EVE" && dayShifts.includes("PM"));
 }
 
