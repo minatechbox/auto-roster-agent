@@ -421,11 +421,86 @@ const PERIOD_LABEL_FALLBACK: Record<ServicePeriodKey, string> = {
   closing: "收檔",
 };
 
-function slotDurationHours(slot: ShiftTimeSlot): number {
+function slotDurationHours(slot: { start: string; end: string }): number {
   const start = parseHhMmToMinutes(slot.start);
   const end = parseHhMmToMinutes(slot.end);
   if (start === null || end === null || end <= start) return 0;
   return Math.round(((end - start) / 60) * 100) / 100;
+}
+
+// ── shift_time_slots read-adapter（向下／向上兼容） ──
+// 舊式：ShiftTimeSlot[]；migration_v2：{ servicePeriods: [...], byEmployment: { FT, HFT, PT } }
+interface ShiftRange {
+  start: string;
+  end: string;
+}
+
+function rawShiftSlots(rules: RosterRules): unknown {
+  return (rules as unknown as { shift_time_slots?: unknown } | null | undefined)?.shift_time_slots;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** 把任意陣列過濾成合法的 HH:mm 時間段（保留原字串）。 */
+function slotRanges(raw: unknown): ShiftRange[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ShiftRange[] = [];
+  for (const item of raw) {
+    if (!isPlainObject(item)) continue;
+    const { start, end } = item;
+    if (typeof start !== "string" || typeof end !== "string") continue;
+    const s = parseHhMmToMinutes(start);
+    const e = parseHhMmToMinutes(end);
+    if (s === null || e === null || e <= s) continue;
+    out.push({ start, end });
+  }
+  return out;
+}
+
+/** 六大營業時段：舊式陣列本身，或 v2 的 servicePeriods。 */
+export function servicePeriodSlotsFromRules(rules: RosterRules): ShiftTimeSlot[] {
+  const raw = rawShiftSlots(rules);
+  const list = isPlainObject(raw) ? raw.servicePeriods : raw;
+  if (!Array.isArray(list)) return [];
+  const out: ShiftTimeSlot[] = [];
+  for (const item of list) {
+    if (!isPlainObject(item)) continue;
+    const { id, start, end } = item;
+    if (typeof id !== "string" || !SERVICE_PERIOD_IDS.includes(id as ServicePeriodKey)) continue;
+    if (typeof start !== "string" || typeof end !== "string") continue;
+    out.push({ id: id as ServicePeriodKey, start, end });
+  }
+  return out;
+}
+
+/** 全部可排時間段：舊式 = 全陣列；v2 = servicePeriods + 各職級時段（去重）。 */
+export function allShiftRangesFromRules(rules: RosterRules): ShiftRange[] {
+  const raw = rawShiftSlots(rules);
+  if (!isPlainObject(raw)) return slotRanges(raw);
+  const ranges = slotRanges(raw.servicePeriods);
+  if (isPlainObject(raw.byEmployment)) {
+    for (const list of Object.values(raw.byEmployment)) ranges.push(...slotRanges(list));
+  }
+  const seen = new Set<string>();
+  return ranges.filter((range) => {
+    const key = `${range.start}-${range.end}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** 職級專屬時間段：v2 讀 byEmployment[type]；舊式／未設定回傳 null。 */
+export function employmentRangesFromRules(
+  rules: RosterRules,
+  employmentType: EmploymentType,
+): ShiftRange[] | null {
+  const raw = rawShiftSlots(rules);
+  if (!isPlainObject(raw) || !isPlainObject(raw.byEmployment)) return null;
+  const ranges = slotRanges(raw.byEmployment[employmentType]);
+  return ranges.length > 0 ? ranges : null;
 }
 
 export function employmentTypeFromCategory(category: StaffCategory): EmploymentType {
@@ -459,11 +534,10 @@ export interface DbPeriodSpec {
   endMinutes: number;
 }
 
-/** 時間段一律讀 rules.shift_time_slots，按 SERVICE_PERIOD_IDS 順序輸出。 */
+/** 時間段一律讀 rules.shift_time_slots（兼容舊陣列／v2 物件），按 SERVICE_PERIOD_IDS 順序輸出。 */
 export function servicePeriodsFromRules(rules: RosterRules): DbPeriodSpec[] {
-  const slots = Array.isArray(rules?.shift_time_slots) ? rules.shift_time_slots : [];
   const specs: DbPeriodSpec[] = [];
-  for (const slot of slots) {
+  for (const slot of servicePeriodSlotsFromRules(rules)) {
     const start = parseHhMmToMinutes(slot.start);
     const end = parseHhMmToMinutes(slot.end);
     if (start === null || end === null || end <= start) continue;
@@ -632,13 +706,15 @@ export function shiftOptionsForEmployment(
   rules: RosterRules,
   employmentType: EmploymentType,
 ): string[] {
-  const slots = Array.isArray(rules?.shift_time_slots) ? rules.shift_time_slots : [];
   const standard = standardDailyHoursFor(employmentType, rules);
-  const matched = slots
+  const matched = allShiftRangesFromRules(rules)
     .filter((slot) => Math.abs(slotDurationHours(slot) - standard) < 0.01)
     .map((slot) => `${slot.start}-${slot.end}`);
-  // 防呆：DB 未提供對應長度時段時，退回全部時間段，避免完全排唔到班。
-  return matched.length > 0 ? matched : slots.map((slot) => `${slot.start}-${slot.end}`);
+  if (matched.length > 0) return matched;
+  // 防呆：v2 有 byEmployment 但長度不符時，先用該職級清單；再去重退回全部時間段。
+  const employmentSlots = employmentRangesFromRules(rules, employmentType);
+  if (employmentSlots) return employmentSlots.map((slot) => `${slot.start}-${slot.end}`);
+  return allShiftRangesFromRules(rules).map((slot) => `${slot.start}-${slot.end}`);
 }
 
 /** 員工可揀時間段：管理層 = 彈性；其他 = 職級時間段 + 固定時間 + 彈性選項。 */
@@ -648,7 +724,7 @@ export function eligibleShiftOptions(employee: Employee, rules: RosterRules): st
     ? employee.flexible_shift_options
     : [];
   if (isManagementPosition(employee.position)) {
-    const all = (rules?.shift_time_slots ?? []).map((slot) => `${slot.start}-${slot.end}`);
+    const all = allShiftRangesFromRules(rules).map((slot) => `${slot.start}-${slot.end}`);
     return Array.from(new Set([...all, ...fixed, ...flexible]));
   }
   return Array.from(
