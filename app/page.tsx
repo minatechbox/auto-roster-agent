@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import {
   type EmployeeAvailability,
   type RosterWarning,
+  type Schedule,
   type WeekRoster,
   type WorkingShift,
 } from "@/lib/types";
@@ -12,6 +13,7 @@ import {
   STAFF_CONFIG,
   coveredPeriodIds,
   formatAssignmentTimeLabel,
+  getAssignmentWindowMinutes,
   hoursForEmployeeShift,
   periodDurationHours,
   periodTimeSlot,
@@ -28,6 +30,7 @@ import {
   isIntakeNote,
   summarizeSchedule,
 } from "@/lib/roster/schedule";
+import ConfigDrawer from "@/components/ConfigDrawer";
 
 interface RosterApiResponse {
   rosters?: WeekRoster[];
@@ -51,6 +54,51 @@ interface ApproveResponse {
 interface SaveDayResponse {
   roster?: WeekRoster;
   error?: string;
+}
+
+/** /api/rosters（action: recalculate）回應。 */
+interface RecalculateResponse {
+  roster?: WeekRoster;
+  schedule?: Schedule;
+  warnings?: RosterWarning[];
+  stats?: StaffStats;
+  persisted?: boolean;
+  error?: string;
+}
+
+interface StaffStats {
+  totalCount: number;
+  ftCount: number;
+  hftCount: number;
+  ptCount: number;
+}
+
+interface EmployeeMeta {
+  rank: string;
+  employment_type: string;
+}
+
+interface ConfigApiResponse {
+  employees?: unknown;
+  stats?: StaffStats;
+  error?: string;
+}
+
+/** 手改時間面板：一日多段班次逐段編輯。 */
+interface EditSegment {
+  /** 前端臨時 key（方便 React list 與移除）。 */
+  key: string;
+  start: string;
+  end: string;
+}
+
+interface EditCellState {
+  employee: string;
+  day: string;
+  segments: EditSegment[];
+  /** 打開彈窗時的上班／落班（分鐘）。早收以此為準，不會連撳累減。 */
+  baselineStartMin: number;
+  baselineEndMin: number;
 }
 
 type DayDuty = "AM" | "PM" | "EVE" | "leave" | "OFF";
@@ -85,6 +133,7 @@ type IntakeTab = "whatsapp" | "wechat" | "image";
 const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const WEEKDAY_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
+const DAY_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 function formatDayHeader(dateStr: string): { top: string; sub: string } {
   const d = new Date(`${dateStr}T00:00:00Z`);
@@ -97,20 +146,37 @@ function formatDayHeader(dateStr: string): { top: string; sub: string } {
   return { top: `週${weekday}`, sub: `${mm}/${dd}` };
 }
 
+// ── 清新東南亞現代風（100% 對齊 ConfigDrawer.tsx） ──
+const BTN_PRIMARY =
+  "rounded-lg bg-[#1D8A74] px-4 py-2 text-sm font-medium text-white transition hover:bg-[#167763] disabled:cursor-not-allowed disabled:opacity-50";
+const BTN_OUTLINE =
+  "rounded-lg border border-[#1D8A74] bg-white px-3.5 py-2 text-sm font-medium text-[#167763] transition hover:bg-[#E8F3F0] disabled:opacity-50";
+const BTN_GHOST =
+  "rounded-lg border border-[#E4DDD2] bg-white px-3.5 py-2 text-sm font-medium text-zinc-700 transition hover:bg-[#F5F1EB] disabled:opacity-50";
+const FIELD =
+  "mt-1 w-full rounded-lg border border-[#E4DDD2] bg-white px-3 py-1.5 text-sm text-zinc-900 outline-none transition focus:border-[#1D8A74] focus:ring-2 focus:ring-[#1D8A74]/20";
+const CARD = "rounded-2xl border border-[#E4DDD2] bg-white";
+const PANEL = "bg-[#F5F1EB]";
+const ROWLINE = "border-[#EFE9E0]";
+const LBL = "block text-xs font-medium text-zinc-500";
+const TH = "px-2 py-2 text-center text-[11px] font-semibold uppercase tracking-wide text-zinc-600";
+const CHK = "h-3.5 w-3.5 accent-[#1D8A74]";
+
 const CHIP_SIZE =
   "inline-flex h-7 w-full items-center justify-center rounded px-0.5 text-[10px] font-medium leading-none";
 
 function chipClass(on: boolean, tone: "work" | "leave" | "off" = "work"): string {
   if (on && tone === "leave") return `${CHIP_SIZE} bg-rose-600 text-white`;
-  if (on && tone === "off") return `${CHIP_SIZE} bg-zinc-700 text-white`;
-  if (on) return `${CHIP_SIZE} bg-indigo-600 text-white`;
-  return `${CHIP_SIZE} bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700`;
+  if (on && tone === "off") return `${CHIP_SIZE} bg-zinc-400 text-white`;
+  if (on) return `${CHIP_SIZE} bg-[#1D8A74] text-white`;
+  return `${CHIP_SIZE} bg-[#F5F1EB] text-zinc-600 hover:bg-[#E8F3F0]`;
 }
 
+/** 只作 DB 未設定職位時的最後防呆（不參與任何工時計算）。 */
 const DEMO_RANK: Record<string, string> = {
   "Jamie Cole": "SM",
   "Noah Blake": "M",
-  "Casey Quinn": "AM",
+  "Casey Quinn": "A.M",
   "Riley Shaw": "S",
   "Avery Kim": "S",
   "Jordan Hale": "W",
@@ -124,10 +190,17 @@ const DEMO_RANK: Record<string, string> = {
   "Rowan Patel": "WH",
 };
 
-function roleParts(emp: EmployeeAvailability | undefined): { rank: string; kind: string } {
+function roleParts(
+  emp: EmployeeAvailability | undefined,
+  meta?: EmployeeMeta,
+): { rank: string; kind: string } {
+  const name = emp?.name ?? "";
+  const category = emp ? resolveCategory(emp) : null;
+  const fallbackKind =
+    category === "part_time" ? "PT" : category === "half_full_time" ? "HFT" : "FT";
   return {
-    rank: DEMO_RANK[emp?.name ?? ""] ?? "S",
-    kind: emp && resolveCategory(emp) === "part_time" ? "P.T" : "F.T",
+    rank: meta?.rank || DEMO_RANK[name] || "S",
+    kind: meta?.employment_type || fallbackKind,
   };
 }
 
@@ -162,6 +235,46 @@ function slotStartMinutes(slot: string): number {
   const [hh, mm] = start.split(":").map((part) => Number(part));
   if (!Number.isFinite(hh) || !Number.isFinite(mm)) return 0;
   return hh * 60 + mm;
+}
+
+function hhmmToMinutes(raw: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(raw.trim());
+  if (!match) return null;
+  const hh = Number(match[1]);
+  const mm = Number(match[2]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh < 0 || hh > 24 || mm < 0 || mm > 59) return null;
+  if (hh === 24 && mm !== 0) return null;
+  return hh * 60 + mm;
+}
+
+function formatMinutes(minutes: number): string {
+  const hh = Math.floor(minutes / 60);
+  const mm = minutes % 60;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+/** 相連或重疊的時段合併成一段；中間有空隙先拆開。 */
+function mergeConsecutiveWindows(
+  windows: { start: number; end: number }[],
+): { start: number; end: number }[] {
+  const sorted = [...windows].sort((a, b) => a.start - b.start);
+  const merged: { start: number; end: number }[] = [];
+  for (const win of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && win.start <= last.end) {
+      last.end = Math.max(last.end, win.end);
+    } else {
+      merged.push({ start: win.start, end: win.end });
+    }
+  }
+  return merged;
+}
+
+function shiftFromStart(startMinutes: number): WorkingShift {
+  if (startMinutes < 11 * 60) return "AM";
+  if (startMinutes < 17 * 60) return "PM";
+  return "EVE";
 }
 
 function slotForEmployee(emp: EmployeeAvailability, shift: WorkingShift): string {
@@ -199,6 +312,20 @@ export default function Home() {
   const [submittingImage, setSubmittingImage] = useState<boolean>(false);
   const [approvingId, setApprovingId] = useState<string | null>(null);
 
+  // 店舖與員工設定抽屜 + DB 動態人數
+  const [configOpen, setConfigOpen] = useState<boolean>(false);
+  const [menuOpen, setMenuOpen] = useState<boolean>(false);
+  const [stats, setStats] = useState<StaffStats | null>(null);
+  const [empMeta, setEmpMeta] = useState<Map<string, EmployeeMeta>>(new Map());
+
+  // 列印積木：預設兩塊都印
+  const [printWeekGrid, setPrintWeekGrid] = useState<boolean>(true);
+  const [printPeriodGrid, setPrintPeriodGrid] = useState<boolean>(true);
+
+  // 手改時間面板（按段修改，支援多段）
+  const [editCell, setEditCell] = useState<EditCellState | null>(null);
+  const [savingCell, setSavingCell] = useState<boolean>(false);
+
   const [weekStart, setWeekStart] = useState<string>("2026-11-22");
   const [department, setDepartment] = useState<string>("Superme Cafe");
   const [availabilityText, setAvailabilityText] = useState<string>(SAMPLE_TEXT);
@@ -217,6 +344,31 @@ export default function Home() {
   const excessRef = useRef<HTMLDivElement>(null);
   const rosterRef = useRef<WeekRoster | null>(null);
   const saveQueue = useRef(Promise.resolve());
+
+  /** 由 /api/config 讀取 DB 人數統計與職位標記（Supabase 未設定時靜默失敗）。 */
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await fetch("/api/config", { cache: "no-store" });
+      const data = (await res.json()) as ConfigApiResponse;
+      if (!res.ok) return;
+      setStats(data.stats ?? null);
+      const rows = Array.isArray(data.employees) ? data.employees : [];
+      const next = new Map<string, EmployeeMeta>();
+      for (const raw of rows) {
+        const row = raw as Record<string, unknown>;
+        if (row.is_active === false) continue;
+        const name = typeof row.name === "string" ? row.name : "";
+        if (!name) continue;
+        const role = typeof row.role_title === "string" ? row.role_title : "";
+        const legacy = typeof row.position === "string" ? row.position : "";
+        const type = typeof row.employment_type === "string" ? row.employment_type : "FT";
+        next.set(name, { rank: role || legacy, employment_type: type });
+      }
+      setEmpMeta(next);
+    } catch {
+      /* 未設定 Supabase 時不阻斷頁面 */
+    }
+  }, []);
 
   const loadRosters = useCallback(async (preferredId?: string | null) => {
     try {
@@ -253,12 +405,15 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
     void Promise.resolve().then(() => {
-      if (!cancelled) void loadRosters();
+      if (!cancelled) {
+        void loadRosters();
+        void loadStats();
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, [loadRosters]);
+  }, [loadRosters, loadStats]);
 
   useEffect(() => {
     return () => {
@@ -333,10 +488,11 @@ export default function Home() {
       }
       const createdId = data.roster?.id ?? null;
       await loadRosters(createdId);
+      await loadStats();
       setFeedback(
         data.persisted
-          ? `已按示範條件生成草稿（10 位正選、4 位後補，ID: ${createdId ?? "—"}）`
-          : "已按示範條件生成草稿，但未持久化至 Supabase"
+          ? `已按 DB 員工庫生成草稿（ID: ${createdId ?? "—"}）`
+          : "已按 DB 員工庫生成草稿，但未持久化至 Supabase"
       );
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "由員工庫生成草稿時發生錯誤");
@@ -550,7 +706,6 @@ export default function Home() {
 
   const days = selectedRoster?.schedule?.days ?? [];
   const assignments = selectedRoster?.schedule?.assignments ?? [];
-  const employeeHours = selectedRoster?.schedule?.employeeHours ?? [];
   let weekDays: string[] = [];
   try {
     weekDays = weekDates(weekStart);
@@ -605,6 +760,12 @@ export default function Home() {
     return weekDays.filter((day) => dayKind(employee, day) === "work").length;
   }
 
+  function weekHoursFor(employee: string): number {
+    return assignments
+      .filter((item) => item.employee === employee)
+      .reduce((sum, item) => sum + (item.hours ?? 0), 0);
+  }
+
   function splitDayHours(day: string): {
     regular: number;
     overtime: number;
@@ -648,14 +809,6 @@ export default function Home() {
     { key: "all", label: "每日總工時", values: daySplits.map((item) => item.total) },
   ];
 
-  const empHoursMap = new Map<string, { totalHours: number; shiftsCount: number }>();
-  for (const eh of employeeHours) {
-    empHoursMap.set(eh.employee, {
-      totalHours: eh.totalHours,
-      shiftsCount: eh.shiftsCount,
-    });
-  }
-
   const coverageDays = selectedRoster
     ? auditWeekCoverage(
         weekDays,
@@ -667,20 +820,20 @@ export default function Home() {
     coverageDays.find((item) => item.date === activeDay) ?? null;
 
   async function handleApplyDuty(employeeName: string, day: string, duty: DayDuty) {
-    const selectedRoster = rosterRef.current;
-    if (!selectedRoster) return;
+    const selected = rosterRef.current;
+    if (!selected) return;
 
     const existing =
-      selectedRoster.parsed.employees.find((e) => e.name === employeeName) ??
+      selected.parsed.employees.find((e) => e.name === employeeName) ??
       ({
         name: employeeName,
-        department: selectedRoster.department || "Superme Cafe",
+        department: selected.department || "Superme Cafe",
         leave: [],
         available: {},
       } satisfies EmployeeAvailability);
 
-    const employees = selectedRoster.parsed.employees.some((e) => e.name === employeeName)
-      ? selectedRoster.parsed.employees.map((e) => {
+    const employees = selected.parsed.employees.some((e) => e.name === employeeName)
+      ? selected.parsed.employees.map((e) => {
           if (e.name !== employeeName) {
             return { ...e, leave: [...(e.leave ?? [])] };
           }
@@ -689,7 +842,7 @@ export default function Home() {
           return { ...e, leave };
         })
       : [
-          ...selectedRoster.parsed.employees.map((e) => ({
+          ...selected.parsed.employees.map((e) => ({
             ...e,
             leave: [...(e.leave ?? [])],
           })),
@@ -700,7 +853,7 @@ export default function Home() {
         ];
 
     const nextEmp = employees.find((e) => e.name === employeeName) ?? existing;
-    let nextAssignments = selectedRoster.schedule.assignments.filter(
+    let nextAssignments = selected.schedule.assignments.filter(
       (a) => !(a.employee === employeeName && a.date === day),
     );
     if (duty === "AM" || duty === "PM" || duty === "EVE") {
@@ -710,14 +863,14 @@ export default function Home() {
           date: day,
           shift: duty,
           employee: employeeName,
-          department: nextEmp.department || selectedRoster.department || "Superme Cafe",
+          department: nextEmp.department || selected.department || "Superme Cafe",
           hours: hoursForEmployeeShift(nextEmp),
           timeSlot: slotForEmployee(nextEmp, duty),
         },
       ];
     }
 
-    const scheduleDays = weekDays.length === 7 ? weekDays : selectedRoster.schedule.days;
+    const scheduleDays = weekDays.length === 7 ? weekDays : selected.schedule.days;
     const employeeNames = [...new Set(employees.map((e) => e.name))];
     const { dailyHours: nextDaily, employeeHours: nextEmpHours } = summarizeSchedule(
       scheduleDays,
@@ -725,15 +878,15 @@ export default function Home() {
       employeeNames,
     );
     const nextWarnings = [
-      ...(selectedRoster.warnings ?? []).filter(isIntakeNote),
+      ...(selected.warnings ?? []).filter(isIntakeNote),
       ...evaluateRosterWarnings(scheduleDays, employees, nextAssignments),
     ];
 
     const nextRoster: WeekRoster = {
-      ...selectedRoster,
+      ...selected,
       parsed: { employees },
       schedule: {
-        ...selectedRoster.schedule,
+        ...selected.schedule,
         days: scheduleDays,
         assignments: nextAssignments,
         dailyHours: nextDaily,
@@ -742,7 +895,7 @@ export default function Home() {
       warnings: nextWarnings,
     };
 
-    const rosterId = selectedRoster.id;
+    const rosterId = selected.id;
     rosterRef.current = nextRoster;
     setRosters((prev) =>
       prev.map((item) => (item.id === rosterId ? nextRoster : item)),
@@ -785,19 +938,19 @@ export default function Home() {
     day: string,
     periodId: ServicePeriodId,
   ) {
-    const selectedRoster = rosterRef.current;
-    if (!selectedRoster) return;
+    const selected = rosterRef.current;
+    if (!selected) return;
 
     const existing =
-      selectedRoster.parsed.employees.find((e) => e.name === employeeName) ??
+      selected.parsed.employees.find((e) => e.name === employeeName) ??
       ({
         name: employeeName,
-        department: selectedRoster.department || "Superme Cafe",
+        department: selected.department || "Superme Cafe",
         leave: [],
         available: {},
       } satisfies EmployeeAvailability);
 
-    const dayAssignments = selectedRoster.schedule.assignments.filter(
+    const dayAssignments = selected.schedule.assignments.filter(
       (item) => item.employee === employeeName && item.date === day,
     );
     const covered = new Set(coveredPeriodIds(dayAssignments));
@@ -807,8 +960,8 @@ export default function Home() {
       covered.add(periodId);
     }
 
-    const employees = selectedRoster.parsed.employees.some((e) => e.name === employeeName)
-      ? selectedRoster.parsed.employees.map((e) => {
+    const employees = selected.parsed.employees.some((e) => e.name === employeeName)
+      ? selected.parsed.employees.map((e) => {
           if (e.name !== employeeName) {
             return { ...e, leave: [...(e.leave ?? [])] };
           }
@@ -816,7 +969,7 @@ export default function Home() {
           return { ...e, leave };
         })
       : [
-          ...selectedRoster.parsed.employees.map((e) => ({
+          ...selected.parsed.employees.map((e) => ({
             ...e,
             leave: [...(e.leave ?? [])],
           })),
@@ -824,7 +977,7 @@ export default function Home() {
         ];
 
     const nextEmp = employees.find((e) => e.name === employeeName) ?? existing;
-    let nextAssignments = selectedRoster.schedule.assignments.filter(
+    let nextAssignments = selected.schedule.assignments.filter(
       (item) => !(item.employee === employeeName && item.date === day),
     );
     for (const period of SERVICE_PERIODS) {
@@ -835,14 +988,14 @@ export default function Home() {
           date: day,
           shift: shiftForPeriod(period),
           employee: employeeName,
-          department: nextEmp.department || selectedRoster.department || "Superme Cafe",
+          department: nextEmp.department || selected.department || "Superme Cafe",
           hours: periodDurationHours(period),
           timeSlot: periodTimeSlot(period),
         },
       ];
     }
 
-    const scheduleDays = weekDays.length === 7 ? weekDays : selectedRoster.schedule.days;
+    const scheduleDays = weekDays.length === 7 ? weekDays : selected.schedule.days;
     const employeeNames = [...new Set(employees.map((e) => e.name))];
     const { dailyHours: nextDaily, employeeHours: nextEmpHours } = summarizeSchedule(
       scheduleDays,
@@ -850,15 +1003,15 @@ export default function Home() {
       employeeNames,
     );
     const nextWarnings = [
-      ...(selectedRoster.warnings ?? []).filter(isIntakeNote),
+      ...(selected.warnings ?? []).filter(isIntakeNote),
       ...evaluateRosterWarnings(scheduleDays, employees, nextAssignments),
     ];
 
     const nextRoster: WeekRoster = {
-      ...selectedRoster,
+      ...selected,
       parsed: { employees },
       schedule: {
-        ...selectedRoster.schedule,
+        ...selected.schedule,
         days: scheduleDays,
         assignments: nextAssignments,
         dailyHours: nextDaily,
@@ -867,7 +1020,7 @@ export default function Home() {
       warnings: nextWarnings,
     };
 
-    const rosterId = selectedRoster.id;
+    const rosterId = selected.id;
     rosterRef.current = nextRoster;
     setRosters((prev) =>
       prev.map((item) => (item.id === rosterId ? nextRoster : item)),
@@ -920,7 +1073,7 @@ export default function Home() {
       const totalH = matched.reduce((sum, m) => sum + (m.hours ?? 0), 0);
       return {
         label: formatAssignmentTimeLabel(matched),
-        sub: totalH > 0 ? `${totalH}h` : undefined,
+        sub: totalH > 0 ? `${formatHours(totalH)}` : undefined,
         kind: "work",
       };
     }
@@ -930,9 +1083,221 @@ export default function Home() {
     return { label: dutyCode(employee, day, "off"), kind: "off" };
   }
 
+  /** 當日列「改時間」→ 連續時段合併成上班—落班，有空隙先拆段。 */
+  function openTimeEditor(employee: string, day: string) {
+    const matched = assignments.filter(
+      (item) => item.employee === employee && item.date === day,
+    );
+    const merged = mergeConsecutiveWindows(matched.map((item) => getAssignmentWindowMinutes(item)));
+    const segments: EditSegment[] =
+      merged.length > 0
+        ? merged.map((win, index) => ({
+            key: `seg-${index}`,
+            start: formatMinutes(win.start),
+            end: formatMinutes(win.end),
+          }))
+        : [{ key: "seg-0", start: "07:00", end: "17:00" }];
+    const baselineStartMin = hhmmToMinutes(segments[0]?.start ?? "07:00") ?? 7 * 60;
+    const baselineEndMin =
+      hhmmToMinutes(segments[segments.length - 1]?.end ?? "17:00") ?? 17 * 60;
+    setEditCell({ employee, day, segments, baselineStartMin, baselineEndMin });
+  }
+
+  /** 早收以打開時的落班為準；半日更收成一段（上班後 5 小時）。 */
+  function applyTimeShortcut(kind: "early1" | "early2" | "half") {
+    setEditCell((prev) => {
+      if (!prev) return prev;
+      if (kind === "half") {
+        const endMin = Math.min(prev.baselineStartMin + 5 * 60, 24 * 60);
+        return {
+          ...prev,
+          segments: [
+            {
+              key: "seg-half",
+              start: formatMinutes(prev.baselineStartMin),
+              end: formatMinutes(endMin),
+            },
+          ],
+        };
+      }
+      const cut = kind === "early1" ? 60 : 120;
+      let nextEnd = prev.baselineEndMin - cut;
+      if (prev.segments.length === 0) return prev;
+      const segments = prev.segments.map((seg, index) => {
+        if (index !== prev.segments.length - 1) return seg;
+        const startMin = hhmmToMinutes(seg.start);
+        if (startMin !== null && nextEnd <= startMin) nextEnd = Math.min(startMin + 30, 24 * 60);
+        return { ...seg, end: formatMinutes(nextEnd) };
+      });
+      return { ...prev, segments };
+    });
+  }
+
+  /** 逐段更新時間。 */
+  function patchSegment(key: string, field: "start" | "end", value: string) {
+    setEditCell((prev) =>
+      prev
+        ? {
+            ...prev,
+            segments: prev.segments.map((seg) =>
+              seg.key === key ? { ...seg, [field]: value } : seg,
+            ),
+          }
+        : prev,
+    );
+  }
+
+  function removeSegment(key: string) {
+    setEditCell((prev) =>
+      prev ? { ...prev, segments: prev.segments.filter((seg) => seg.key !== key) } : prev,
+    );
+  }
+
+  function addSegment() {
+    setEditCell((prev) => {
+      if (!prev) return prev;
+      const last = prev.segments[prev.segments.length - 1];
+      const nextStart = last?.end ?? "17:00";
+      const startMin = hhmmToMinutes(nextStart);
+      const endMin = startMin === null ? null : Math.min(startMin + 5 * 60, 24 * 60);
+      const fmt = (minutes: number) =>
+        `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+      return {
+        ...prev,
+        segments: [
+          ...prev.segments,
+          {
+            key: `seg-${Date.now()}`,
+            start: nextStart,
+            end: endMin === null ? "22:00" : fmt(endMin),
+          },
+        ],
+      };
+    });
+  }
+
+  /** 確認按段修改 → 整組時段送去 /api/rosters (recalculate) 重算工時／OT／補鐘。 */
+  async function handleConfirmTimeEdit() {
+    const target = editCell;
+    const selected = rosterRef.current;
+    if (!target || !selected) return;
+
+    if (target.segments.length === 0) {
+      setErrorMsg("最少要保留一段上班時間，或按「取消」。");
+      return;
+    }
+
+    const parsed: { start: string; end: string; startMin: number; endMin: number }[] = [];
+    for (const seg of target.segments) {
+      const startMin = hhmmToMinutes(seg.start);
+      const endMin = hhmmToMinutes(seg.end);
+      if (startMin === null || endMin === null) {
+        setErrorMsg("時間格式必須為 HH:mm（例如 07:00）。");
+        return;
+      }
+      if (endMin <= startMin) {
+        setErrorMsg(`時段 ${seg.start}-${seg.end} 落班時間必須遲過上班時間。`);
+        return;
+      }
+      parsed.push({ start: seg.start, end: seg.end, startMin, endMin });
+    }
+    parsed.sort((a, b) => a.startMin - b.startMin);
+
+    const emp =
+      selected.parsed.employees.find((item) => item.name === target.employee) ?? null;
+    const empDepartment = emp?.department || selected.department || "Superme Cafe";
+
+    const keptAssignments = selected.schedule.assignments.filter(
+      (item) => !(item.employee === target.employee && item.date === target.day),
+    );
+    const nextAssignments = [
+      ...keptAssignments,
+      ...parsed.map((seg) => ({
+        date: target.day,
+        shift: shiftFromStart(seg.startMin),
+        employee: target.employee,
+        department: empDepartment,
+        hours: Math.round(((seg.endMin - seg.startMin) / 60) * 100) / 100,
+        timeSlot: `${seg.start}-${seg.end}`,
+      })),
+    ];
+
+    const nextRoster: WeekRoster = {
+      ...selected,
+      schedule: { ...selected.schedule, assignments: nextAssignments },
+    };
+    rosterRef.current = nextRoster;
+    setRosters((prev) =>
+      prev.map((item) => (item.id === selected.id ? nextRoster : item)),
+    );
+    setSelectedDay(target.day);
+    setSavingCell(true);
+    setErrorMsg(null);
+    const summary = parsed.map((seg) => `${seg.start}-${seg.end}`).join(" + ");
+    setFeedback(
+      `已改 ${target.employee} ${formatDayHeader(target.day).top} 為 ${summary}，重算工時中...`,
+    );
+
+    try {
+      const res = await fetch("/api/rosters", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "recalculate",
+          weekStart: selected.weekStart,
+          department: selected.department ?? department,
+          id: selected.id ?? undefined,
+          parsed: selected.parsed,
+          schedule: nextRoster.schedule,
+        }),
+      });
+      const data = (await res.json()) as RecalculateResponse;
+      if (!res.ok) {
+        throw new Error(data.error || `重算工時失敗（HTTP ${res.status}）`);
+      }
+      if (data.stats) setStats(data.stats);
+
+      const merged: WeekRoster = data.roster
+        ? data.roster
+        : {
+            ...nextRoster,
+            schedule: data.schedule ?? nextRoster.schedule,
+            warnings: data.warnings ?? nextRoster.warnings,
+          };
+
+      rosterRef.current = merged;
+      setRosters((prev) =>
+        prev.map((item) => (item.id === merged.id ? merged : item)),
+      );
+      setFeedback(
+        `${target.employee} ${formatDayHeader(target.day).top} ${formatDayHeader(target.day).sub} 已改為 ${summary}（${
+          parsed.length
+        } 段），工時、OT／補鐘已重算${
+          data.persisted === false || !selected.id ? "（未寫入 Supabase）" : "並儲存"
+        }。`,
+      );
+      setEditCell(null);
+    } catch (err) {
+      rosterRef.current = selected;
+      setRosters((prev) =>
+        prev.map((item) => (item.id === selected.id ? selected : item)),
+      );
+      setErrorMsg(err instanceof Error ? err.message : "重算工時時發生錯誤");
+    } finally {
+      setSavingCell(false);
+    }
+  }
+
+  const statItems: { label: string; value: string }[] = [
+    { label: "總人數", value: stats ? String(stats.totalCount) : "—" },
+    { label: "FT", value: stats ? String(stats.ftCount) : "—" },
+    { label: "HFT", value: stats ? String(stats.hftCount) : "—" },
+    { label: "PT", value: stats ? String(stats.ptCount) : "—" },
+  ];
+
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 print:bg-white print:text-black">
-      {/* 列印專用樣式：A4 橫向、隱藏操作介面、黑框白底清晰字體 */}
+    <div className="min-h-screen bg-gradient-to-b from-[#D6EFE8] to-[#CBE8DF] text-zinc-900 print:bg-white print:text-black">
+      {/* 列印專用樣式：A4 橫向、純白省墨、隱藏操作介面 */}
       <style jsx global>{`
         @media print {
           @page {
@@ -951,75 +1316,152 @@ export default function Home() {
           .print-area {
             border: none !important;
             box-shadow: none !important;
+            border-radius: 0 !important;
             padding: 0 !important;
             margin: 0 !important;
             background: #ffffff !important;
           }
           .print-table {
-            min-width: 100% !important;
+            min-width: 0 !important;
             width: 100% !important;
-            font-size: 10px !important;
+            font-size: 8px !important;
           }
           .print-table th,
           .print-table td {
             border: 1px solid #333333 !important;
-            padding: 4px 6px !important;
+            background: #ffffff !important;
+            color: #000000 !important;
+            padding: 2px 3px !important;
             position: static !important;
+          }
+          .print-module {
+            break-inside: avoid;
+            page-break-inside: avoid;
+          }
+          .print-area h2 {
+            font-size: 12px !important;
+          }
+          .print-area h3 {
+            font-size: 10px !important;
+            margin-bottom: 2px !important;
+          }
+          .print-area > * + * {
+            margin-top: 6px !important;
           }
         }
       `}</style>
 
       <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 print:max-w-none print:p-0">
-        <header className="no-print flex flex-col gap-4 border-b border-zinc-200 pb-5 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Superme Cafe · 自動排班控制台
-            </h1>
-            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              週日開週制 · 員工橫向更表、工時核算、六大時段核數（開檔／早餐／午市／下午茶／晚市／收檔）及放假(WH/SH)超額提示。
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2.5">
+        <header className="no-print pb-5">
+          <div className="flex items-start gap-3">
             <button
               type="button"
-              onClick={() => {
-                setLoadingList(true);
-                void loadRosters(selectedId);
-              }}
-              disabled={loadingList}
-              className="rounded-lg border border-zinc-300 bg-white px-3.5 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              onClick={() => setMenuOpen(true)}
+              className={BTN_GHOST}
+              aria-expanded={menuOpen}
             >
-              {loadingList ? "載入中..." : "重新整理"}
+              ☰ 功能選單
             </button>
-            <button
-              type="button"
-              onClick={() => void handleGenerateFromDb()}
-              disabled={generatingDb}
-              className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {generatingDb ? "讀取 DB 排班中..." : "由 DB 員工庫生成草稿"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleGenerateMock()}
-              disabled={generatingMock}
-              className="rounded-lg bg-zinc-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-            >
-              {generatingMock ? "生成中..." : "+ Mock 草稿"}
-            </button>
+            <div className="min-w-0">
+              <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+                Superme Cafe · 自動排班控制台
+              </h1>
+              <p className="mt-1 text-sm text-zinc-600">
+                週日開週制 · 員工橫向更表、工時核算、六大時段核數及放假(WH/SH)超額提示。
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {statItems.map((item) => (
+                  <span
+                    key={item.label}
+                    className="inline-flex items-baseline gap-1.5 rounded-full border border-[#E4DDD2] bg-[#F5F1EB] px-3 py-1 text-xs text-zinc-600"
+                  >
+                    <span className="font-medium">{item.label}</span>
+                    <span className="font-mono text-sm font-bold text-[#167763]">
+                      {item.value}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
         </header>
 
-        <section className="no-print mt-4 rounded-xl border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+        {menuOpen ? (
+          <div className="no-print fixed inset-0 z-40 flex">
+            <aside className="flex h-full w-72 max-w-[85vw] flex-col gap-2 border-r border-[#E4DDD2] bg-white p-4 shadow-xl">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-semibold text-zinc-800">功能選單</span>
+                <button
+                  type="button"
+                  onClick={() => setMenuOpen(false)}
+                  aria-label="關閉功能選單"
+                  className="rounded-md px-2 py-1 text-lg leading-none text-zinc-500 hover:bg-[#F5F1EB]"
+                >
+                  ✕
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setConfigOpen(true);
+                }}
+                className={BTN_PRIMARY}
+              >
+                店舖與員工設定
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setLoadingList(true);
+                  void loadRosters(selectedId);
+                  void loadStats();
+                }}
+                disabled={loadingList}
+                className={BTN_GHOST}
+              >
+                {loadingList ? "載入中..." : "重新整理"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  void handleGenerateFromDb();
+                }}
+                disabled={generatingDb}
+                className={BTN_OUTLINE}
+              >
+                {generatingDb ? "讀取 DB 排班中..." : "由 DB 員工庫生成草稿"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  void handleGenerateMock();
+                }}
+                disabled={generatingMock}
+                className={BTN_GHOST}
+              >
+                {generatingMock ? "生成中..." : "＋ Mock 草稿"}
+              </button>
+            </aside>
+            <button
+              type="button"
+              aria-label="關閉功能選單"
+              className="min-h-full flex-1 bg-zinc-950/40"
+              onClick={() => setMenuOpen(false)}
+            />
+          </div>
+        ) : null}
+
+        <section className={`no-print mt-4 ${CARD} p-4 shadow-[0_10px_40px_-18px_rgba(29,138,116,0.35)]`}>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
-              <label
-                htmlFor="weekStart"
-                className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
-              >
+              <label htmlFor="weekStart" className={LBL}>
                 每週起始日（星期日）
               </label>
-              <div className="relative mt-1">
+              <div className="relative">
                 <input
                   ref={weekStartInputRef}
                   id="weekStart"
@@ -1027,12 +1469,12 @@ export default function Home() {
                   value={weekStart}
                   onChange={(e) => handleWeekStartChange(e.target.value)}
                   onClick={openWeekStartPicker}
-                  className="w-full cursor-pointer rounded-lg border border-zinc-300 bg-white px-3 py-1.5 pr-10 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                  className={`${FIELD} cursor-pointer pr-10`}
                 />
                 <button
                   type="button"
                   onClick={openWeekStartPicker}
-                  className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  className="absolute inset-y-0 right-0 mt-1 flex w-10 items-center justify-center text-zinc-500 hover:text-[#167763]"
                   aria-label="打開月曆揀日期"
                 >
                   📅
@@ -1040,10 +1482,7 @@ export default function Home() {
               </div>
             </div>
             <div>
-              <label
-                htmlFor="department"
-                className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
-              >
+              <label htmlFor="department" className={LBL}>
                 部門名稱
               </label>
               <input
@@ -1052,15 +1491,12 @@ export default function Home() {
                 value={department}
                 onChange={(e) => setDepartment(e.target.value)}
                 placeholder="Superme Cafe"
-                className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                className={FIELD}
               />
             </div>
           </div>
           <div className="relative mt-3" ref={excessRef}>
-            <span
-              id="leaveExcessLabel"
-              className="block text-xs font-medium text-zinc-600 dark:text-zinc-400"
-            >
+            <span id="leaveExcessLabel" className={LBL}>
               放假超額提示
             </span>
             <button
@@ -1068,7 +1504,7 @@ export default function Home() {
               aria-labelledby="leaveExcessLabel"
               aria-expanded={excessOpen}
               onClick={() => setExcessOpen((open) => !open)}
-              className="mt-1 flex w-full items-start justify-between gap-3 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-left text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="mt-1 flex w-full items-start justify-between gap-3 rounded-lg border border-[#E4DDD2] bg-white px-3 py-1.5 text-left text-sm transition hover:bg-[#F5F1EB]"
             >
               <span className="min-w-0">
                 <span
@@ -1082,7 +1518,7 @@ export default function Home() {
                       ? "當日沒有放假超額"
                       : "本週沒有放假超額"}
                 </span>
-                <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700 dark:text-zinc-200">
+                <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700">
                   <PeriodRatio periods={dayCoverage?.periods} />
                 </span>
               </span>
@@ -1091,7 +1527,7 @@ export default function Home() {
               </span>
             </button>
             {excessOpen ? (
-              <ul className="absolute z-20 mt-1 max-h-72 w-full overflow-auto rounded-lg border border-zinc-300 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-950">
+              <ul className="absolute z-20 mt-1 max-h-72 w-full overflow-auto rounded-lg border border-[#E4DDD2] bg-white py-1 shadow-lg">
                 {coverageDays.length === 0 ? (
                   <li className="px-3 py-2 text-sm text-zinc-500">本週沒有放假超額</li>
                 ) : (
@@ -1106,8 +1542,8 @@ export default function Home() {
                             setSelectedDay(day.date);
                             setExcessOpen(false);
                           }}
-                          className={`block w-full px-3 py-1.5 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
-                            on ? "bg-indigo-50 dark:bg-indigo-950/40" : ""
+                          className={`block w-full px-3 py-1.5 text-left text-sm transition hover:bg-[#F5F1EB] ${
+                            on ? "bg-[#E8F3F0]" : ""
                           }`}
                         >
                           <span
@@ -1117,7 +1553,7 @@ export default function Home() {
                               ? `${header.top} ${header.sub} 請假 ${day.leave.salariedLeave}/${day.leave.maxAllowedOff}，請管理員指示`
                               : `${header.top} ${header.sub} 沒有放假超額`}
                           </span>
-                          <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700 dark:text-zinc-200">
+                          <span className="mt-0.5 block whitespace-nowrap text-xs text-zinc-700">
                             <PeriodRatio periods={day.periods} />
                           </span>
                         </button>
@@ -1132,7 +1568,7 @@ export default function Home() {
 
         {weekDays.length === 7 ? (
           <div className="no-print mt-4 grid grid-cols-7 gap-1">
-            {weekDays.map((day) => {
+            {weekDays.map((day, index) => {
               const h = formatDayHeader(day);
               const on = day === activeDay;
               return (
@@ -1140,14 +1576,17 @@ export default function Home() {
                   key={day}
                   type="button"
                   onClick={() => setSelectedDay(day)}
-                  className={`rounded-lg border px-1 py-2 text-center text-xs font-semibold ${
+                  className={`rounded-xl border px-1 py-2 text-center text-xs font-semibold transition ${
                     on
-                      ? "border-indigo-600 bg-indigo-50 text-indigo-950 dark:bg-indigo-950/40 dark:text-indigo-100"
-                      : "border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                      ? "border-[#1D8A74] bg-[#1D8A74] text-white shadow-[0_6px_18px_-8px_rgba(29,138,116,0.9)]"
+                      : "border-[#E4DDD2] bg-white text-zinc-800 hover:bg-[#F5F1EB]"
                   }`}
                 >
+                  <div className="text-[10px] font-normal uppercase tracking-wide opacity-70">
+                    {DAY_EN[index]}
+                  </div>
                   <div>{h.top}</div>
-                  <div className={`font-mono text-[11px] font-normal ${on ? "text-indigo-700 dark:text-indigo-200" : "text-zinc-500"}`}>
+                  <div className={`font-mono text-[11px] font-normal ${on ? "text-white/80" : "text-zinc-500"}`}>
                     {h.sub}
                   </div>
                   {(() => {
@@ -1158,7 +1597,11 @@ export default function Home() {
                         .map((period) => period.shortLabel) ?? [];
                     if (names.length === 0) return null;
                     return (
-                      <div className="mt-0.5 text-[10px] font-bold leading-tight text-rose-600">
+                      <div
+                        className={`mt-0.5 text-[10px] font-bold leading-tight ${
+                          on ? "text-white" : "text-rose-600"
+                        }`}
+                      >
                         唔夠人 {names.join("／")}
                       </div>
                     );
@@ -1169,11 +1612,14 @@ export default function Home() {
           </div>
         ) : null}
 
-        <details className="no-print mt-4 rounded-xl border border-zinc-200 bg-white px-4 py-2 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
-          <summary className="cursor-pointer text-sm font-medium text-zinc-700 dark:text-zinc-200">
-            收更資料 · WhatsApp／WeChat／相片
+        <details className={`no-print mt-4 ${CARD} px-4 py-2`}>
+          <summary className="cursor-pointer text-sm font-medium text-zinc-700">
+            報更貼上 · 支援 WhatsApp / WeChat（微信）
           </summary>
-          <div className="mt-3 flex flex-wrap gap-1.5 rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800">
+          <p className="mt-2 text-[11px] leading-relaxed text-zinc-600">
+            支援 WhatsApp / WeChat（微信）貼上。FT/HFT 填放假日（其餘照編）、PT 填返工日（無報唔編）。
+          </p>
+          <div className={`mt-3 flex flex-wrap gap-1.5 rounded-lg p-1 ${PANEL}`}>
             {(
               [
                 { id: "whatsapp", label: "WhatsApp 文字" },
@@ -1187,8 +1633,8 @@ export default function Home() {
                 onClick={() => setIntakeTab(tab.id)}
                 className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition ${
                   intakeTab === tab.id
-                    ? "bg-white text-zinc-900 shadow-xs dark:bg-zinc-950 dark:text-zinc-100"
-                    : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
+                    ? "bg-[#1D8A74] text-white"
+                    : "text-zinc-600 hover:text-[#167763]"
                 }`}
               >
                 {tab.label}
@@ -1198,35 +1644,35 @@ export default function Home() {
 
           {intakeTab === "whatsapp" ? (
             <form onSubmit={(e) => void handleTextSubmit(e)} className="mt-3 space-y-2">
-              <label htmlFor="availabilityText" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
-                貼上 WhatsApp 群組覆期文字
+              <label htmlFor="availabilityText" className={LBL}>
+                WhatsApp 報更文字（亦可貼 WeChat／微信）
               </label>
               <textarea
                 id="availabilityText"
                 rows={6}
                 value={availabilityText}
                 onChange={(e) => setAvailabilityText(e.target.value)}
-                placeholder="貼上 WhatsApp 群組員工覆期、請假日期..."
-                className="w-full rounded-lg border border-zinc-300 bg-white p-2.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                placeholder="貼上 WhatsApp 或 WeChat（微信）。FT/HFT 填放假日（其餘照編）、PT 填返工日（無報唔編）。"
+                className={`${FIELD} mt-0 p-2.5 font-mono text-xs`}
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
                   onClick={() => setAvailabilityText(SAMPLE_TEXT)}
-                  className="text-xs text-zinc-500 underline hover:text-zinc-800"
+                  className="text-xs text-zinc-500 underline hover:text-[#167763]"
                 >
                   填入範例 WhatsApp 文字
                 </button>
                 <button
                   type="submit"
                   disabled={submittingText}
-                  className="rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-50"
+                  className={BTN_PRIMARY}
                 >
                   {submittingText ? "解析排班中..." : "解析 WhatsApp 生成草稿"}
                 </button>
               </div>
               <p className="text-[11px] text-zinc-500">
-                自動接收：<code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">GET/POST /api/webhook/whatsapp</code>
+                自動接收：<code className="rounded bg-[#F5F1EB] px-1">GET/POST /api/webhook/whatsapp</code>
                 （Meta Cloud API 驗證 token + 文字訊息解析）
               </p>
             </form>
@@ -1234,35 +1680,35 @@ export default function Home() {
 
           {intakeTab === "wechat" ? (
             <form onSubmit={(e) => void handleWechatSubmit(e)} className="mt-3 space-y-2">
-              <label htmlFor="wechatText" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
-                貼上 WeChat 群組／私訊對話紀錄
+              <label htmlFor="wechatText" className={LBL}>
+                WeChat（微信）報更文字（亦可貼 WhatsApp）
               </label>
               <textarea
                 id="wechatText"
                 rows={6}
                 value={wechatText}
                 onChange={(e) => setWechatText(e.target.value)}
-                placeholder="貼上微信群或私訊報更紀錄..."
-                className="w-full rounded-lg border border-zinc-300 bg-white p-2.5 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                placeholder="貼上 WeChat（微信）或 WhatsApp。FT/HFT 填放假日（其餘照編）、PT 填返工日（無報唔編）。"
+                className={`${FIELD} mt-0 p-2.5 font-mono text-xs`}
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
                   onClick={() => setWechatText(SAMPLE_WECHAT_TEXT)}
-                  className="text-xs text-zinc-500 underline hover:text-zinc-800"
+                  className="text-xs text-zinc-500 underline hover:text-[#167763]"
                 >
                   填入範例 WeChat 文字
                 </button>
                 <button
                   type="submit"
                   disabled={submittingWechat}
-                  className="rounded-lg bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:opacity-50"
+                  className={BTN_PRIMARY}
                 >
                   {submittingWechat ? "解析排班中..." : "解析 WeChat 生成草稿"}
                 </button>
               </div>
               <p className="text-[11px] text-zinc-500">
-                自動接收：<code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">GET/POST /api/webhook/wechat</code>
+                自動接收：<code className="rounded bg-[#F5F1EB] px-1">GET/POST /api/webhook/wechat</code>
                 （公眾號 URL 驗證 echostr／企業微信 msg_signature + 訊息解析）
               </p>
             </form>
@@ -1270,7 +1716,7 @@ export default function Home() {
 
           {intakeTab === "image" ? (
             <form onSubmit={(e) => void handleImageSubmit(e)} className="mt-3 space-y-3">
-              <p className="text-xs text-zinc-600 dark:text-zinc-400">
+              <p className="text-xs text-zinc-600">
                 上傳手寫日曆、更期截圖或用手機即場影相。伺服器會用 Vision 讀姓名、請假日同更段。
               </p>
               <input
@@ -1285,14 +1731,14 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => imageInputRef.current?.click()}
-                  className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+                  className={BTN_GHOST}
                 >
                   拍攝或上傳日曆／更期相片
                 </button>
                 <button
                   type="submit"
                   disabled={submittingImage || !imageFile}
-                  className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:opacity-50"
+                  className={BTN_PRIMARY}
                 >
                   {submittingImage ? "辨識相片中..." : "辨識相片生成草稿"}
                 </button>
@@ -1309,7 +1755,7 @@ export default function Home() {
                 <img
                   src={imagePreview}
                   alt="已選日曆相片預覽"
-                  className="max-h-56 rounded-lg border border-zinc-200 object-contain dark:border-zinc-700"
+                  className="max-h-56 rounded-lg border border-[#E4DDD2] object-contain"
                 />
               ) : null}
             </form>
@@ -1317,112 +1763,119 @@ export default function Home() {
         </details>
 
         {feedback && (
-          <div className="no-print mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
+          <div className="no-print mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-900">
             {feedback}
           </div>
         )}
 
         {errorMsg && (
-          <div className="no-print mt-4 rounded-lg border border-red-300 bg-red-50 px-4 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/60 dark:text-red-200">
+          <div className="no-print mt-4 rounded-lg border border-red-300 bg-red-50 px-4 py-2.5 text-sm text-red-900">
             {errorMsg}
           </div>
         )}
 
-
         <section className="no-print mt-5" translate="no">
           <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-              {formatDayHeader(activeDay).top} {formatDayHeader(activeDay).sub} · 當日員工 · 撳掣改更
+            <h2 className="text-sm font-semibold text-zinc-700">
+              {formatDayHeader(activeDay).top} {formatDayHeader(activeDay).sub} · 當日員工 · 撳掣改更 · 改時間
             </h2>
             {savingDay ? (
               <span className="text-xs text-zinc-500">儲存中...</span>
             ) : null}
           </div>
-              {!selectedRoster ? (
-                <p className="mt-3 text-xs text-zinc-500">
-                  暫無本週更表，請按右上角「+ Mock 草稿」後再改各日。
-                </p>
-              ) : activeDay ? (
-                <div className="mt-1">
-                  <ul className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
-                    {[
-                      ...orderedEmployees.map((name) => ({ name, reserve: false })),
-                      ...reserveEmployees.map((emp) => ({ name: emp.name, reserve: true })),
-                    ].map((row) => {
-                      const dayAssignments = assignments.filter(
-                        (item) => item.employee === row.name && item.date === activeDay,
-                      );
-                      const covered = new Set(coveredPeriodIds(dayAssignments));
-                      const onLeave = leaveMap.get(row.name)?.has(activeDay) ?? false;
-                      const onRest = !onLeave && covered.size === 0;
-                      const leaveLabel = onLeave ? dutyCode(row.name, activeDay, "leave") : "W";
-                      const restLabel = onRest ? dutyCode(row.name, activeDay, "off") : "AL";
-                      return (
-                        <li
-                          key={row.name}
-                          className="grid grid-cols-[7.5rem_1fr] items-center gap-2 border-b border-zinc-100 py-1.5 dark:border-zinc-800"
-                        >
-                          <span className="truncate text-sm font-medium">
-                            {row.name}
-                            {row.reserve ? (
-                              <span className="ml-1 text-[10px] font-normal text-zinc-400">
-                                後備
-                              </span>
-                            ) : null}
+          {!selectedRoster ? (
+            <p className="mt-3 text-xs text-zinc-500">
+              暫無本週更表，請開左上角「☰ 功能選單」按「＋ Mock 草稿」後再改各日。
+            </p>
+          ) : activeDay ? (
+            <div className="mt-1">
+              <ul className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
+                {[
+                  ...orderedEmployees.map((name) => ({ name, reserve: false })),
+                  ...reserveEmployees.map((emp) => ({ name: emp.name, reserve: true })),
+                ].map((row) => {
+                  const dayAssignments = assignments.filter(
+                    (item) => item.employee === row.name && item.date === activeDay,
+                  );
+                  const covered = new Set(coveredPeriodIds(dayAssignments));
+                  const onLeave = leaveMap.get(row.name)?.has(activeDay) ?? false;
+                  const onRest = !onLeave && covered.size === 0;
+                  const leaveLabel = onLeave ? dutyCode(row.name, activeDay, "leave") : "W";
+                  const restLabel = onRest ? dutyCode(row.name, activeDay, "off") : "AL";
+                  return (
+                    <li
+                      key={row.name}
+                      className={`grid grid-cols-[7.5rem_1fr] items-center gap-2 border-b py-1.5 ${ROWLINE}`}
+                    >
+                      <span className="truncate text-sm font-medium">
+                        {row.name}
+                        {row.reserve ? (
+                          <span className="ml-1 text-[10px] font-normal text-zinc-400">
+                            後備
                           </span>
-                          <div className="grid grid-cols-8 gap-1">
-                            {SERVICE_PERIODS.map((period) => {
-                              const on = covered.has(period.id);
-                              return (
-                                <button
-                                  key={`${row.name}-${activeDay}-${period.id}`}
-                                  type="button"
-                                  onClick={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                    void handleTogglePeriod(row.name, activeDay, period.id);
-                                  }}
-                                  className={chipClass(on)}
-                                >
-                                  {period.shortLabel}
-                                </button>
-                              );
-                            })}
+                        ) : null}
+                      </span>
+                      <div className="flex items-center gap-1">
+                      <div className="grid min-w-0 flex-1 grid-cols-8 gap-1">
+                        {SERVICE_PERIODS.map((period) => {
+                          const on = covered.has(period.id);
+                          return (
                             <button
+                              key={`${row.name}-${activeDay}-${period.id}`}
                               type="button"
-                              title={onLeave ? `第${leaveLabel.slice(1)}天假` : "請假"}
-                              onClick={() => void handleApplyDuty(row.name, activeDay, "leave")}
-                              className={chipClass(onLeave, "leave")}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                void handleTogglePeriod(row.name, activeDay, period.id);
+                              }}
+                              className={chipClass(on)}
                             >
-                              {leaveLabel}
+                              {period.shortLabel}
                             </button>
-                            <button
-                              type="button"
-                              title={onRest ? `第${restLabel.slice(2)}天` : "休息"}
-                              onClick={() => void handleApplyDuty(row.name, activeDay, "OFF")}
-                              className={chipClass(onRest, "off")}
-                            >
-                              {restLabel}
-                            </button>
-                          </div>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              ) : null}
+                          );
+                        })}
+                        <button
+                          type="button"
+                          title={onLeave ? `第${leaveLabel.slice(1)}天假` : "請假"}
+                          onClick={() => void handleApplyDuty(row.name, activeDay, "leave")}
+                          className={chipClass(onLeave, "leave")}
+                        >
+                          {leaveLabel}
+                        </button>
+                        <button
+                          type="button"
+                          title={onRest ? `第${restLabel.slice(2)}天` : "休息"}
+                          onClick={() => void handleApplyDuty(row.name, activeDay, "OFF")}
+                          className={chipClass(onRest, "off")}
+                        >
+                          {restLabel}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openTimeEditor(row.name, activeDay)}
+                        className="h-7 shrink-0 whitespace-nowrap rounded-md border border-[#1D8A74] bg-white px-2 text-[10px] font-medium text-[#167763] hover:bg-[#E8F3F0]"
+                      >
+                        改時間
+                      </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
         </section>
 
-        {/* 主更表 Matrix 視圖（列印時保留呢一區） */}
         {!selectedRoster ? (
-          <p className="mt-5 text-xs text-zinc-500">
-            暫無本週更表，請按右上角「+ Mock 草稿」後再睇週更表。
+          <p className="mt-5 text-xs text-zinc-600">
+            暫無本週更表，請開左上角「☰ 功能選單」按「＋ Mock 草稿」後再睇週更表。
           </p>
         ) : null}
 
         {selectedRoster ? (
-          <section className="print-area mt-4 space-y-5 rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
-            <div className="flex flex-col justify-between gap-3 border-b border-zinc-200 pb-4 dark:border-zinc-800 sm:flex-row sm:items-center print:border-black print:pb-2">
+          <section className="print-area mt-4 space-y-5 rounded-3xl border border-[#E4DDD2] bg-white p-5 shadow-[0_10px_40px_-12px_rgba(29,138,116,0.25)]">
+            <div className="flex flex-col justify-between gap-3 border-b border-[#E4DDD2] pb-4 sm:flex-row sm:items-center print:border-black print:pb-2">
               <div>
                 <div className="flex items-center gap-2.5">
                   <h2 className="text-lg font-bold">
@@ -1432,8 +1885,8 @@ export default function Home() {
                   <span
                     className={`rounded-full px-2.5 py-0.5 text-xs font-semibold print:border print:border-black print:bg-white print:text-black ${
                       selectedRoster.status === "approved"
-                        ? "bg-emerald-100 text-emerald-800"
-                        : "bg-amber-100 text-amber-800"
+                        ? "bg-[#E8F3F0] text-[#167763]"
+                        : "bg-[#F5F1EB] text-amber-800"
                     }`}
                   >
                     {selectedRoster.status === "approved" ? "已批准" : "草稿 (DRAFT)"}
@@ -1448,7 +1901,7 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => window.print()}
-                  className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+                  className={BTN_GHOST}
                 >
                   🖨️ 列印 / 匯出 PDF 更表
                 </button>
@@ -1460,7 +1913,7 @@ export default function Home() {
                     approvingId === selectedRoster.id
                   }
                   onClick={() => void handleApprove(selectedRoster.id)}
-                  className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-45"
+                  className={BTN_PRIMARY}
                 >
                   {selectedRoster.status === "approved"
                     ? "已批准"
@@ -1471,11 +1924,39 @@ export default function Home() {
               </div>
             </div>
 
-            {/* 橫向一覽排更表（螢幕只睇一日，列印先出全日週） */}
+            {/* 列印積木勾選 */}
+            <div className={`no-print ${CARD} ${PANEL} p-3`}>
+              <p className="text-xs font-semibold text-zinc-700">列印積木</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#E4DDD2] bg-white px-2.5 py-1.5 text-xs text-zinc-700 transition hover:bg-[#E8F3F0]">
+                  <input
+                    type="checkbox"
+                    className={CHK}
+                    checked={printWeekGrid}
+                    onChange={(e) => setPrintWeekGrid(e.target.checked)}
+                  />
+                  員工週更總表
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#E4DDD2] bg-white px-2.5 py-1.5 text-xs text-zinc-700 transition hover:bg-[#E8F3F0]">
+                  <input
+                    type="checkbox"
+                    className={CHK}
+                    checked={printPeriodGrid}
+                    onChange={(e) => setPrintPeriodGrid(e.target.checked)}
+                  />
+                  每日六大時段人手安排表
+                </label>
+              </div>
+              <p className="mt-1.5 text-[11px] text-zinc-400">
+                只印已勾選的積木。兩樣都勾時，A4 橫向緊湊排在同一頁。
+              </p>
+            </div>
+
+            {/* 橫向一覽排更表（螢幕可撳格仔改時間、列印出全日週） */}
             <div>
               <div className="no-print mb-2 flex items-center justify-between">
-                <h3 className="text-sm font-semibold">員工週更表（一目了然）</h3>
-                <span className="text-xs text-zinc-500">只供睇，無掣</span>
+                <h3 className="text-sm font-semibold">員工週更總表（唯讀總覽）</h3>
+                <span className="text-xs text-zinc-500">Sun → Sat 由左至右 · 改時間請用上方當日列</span>
               </div>
 
               {weekDays.length === 0 || orderedEmployees.length === 0 ? (
@@ -1484,16 +1965,16 @@ export default function Home() {
                 </p>
               ) : (
                 <>
-                <div className="no-print overflow-x-auto rounded-lg border border-zinc-300 dark:border-zinc-700">
-                  <table className="pointer-events-none w-full min-w-[920px] border-collapse text-xs">
+                <div className="no-print overflow-x-auto rounded-xl border border-[#E4DDD2]">
+                  <table className="w-full min-w-[920px] border-collapse text-xs">
                     <thead>
-                      <tr className="border-b border-zinc-300 bg-zinc-100 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 print:bg-zinc-200 print:text-black">
-                        <th className="sticky left-0 z-10 w-32 border-r border-zinc-300 bg-zinc-100 px-3 py-2.5 text-left font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200">
+                      <tr className={`border-b border-[#E4DDD2] ${PANEL} text-zinc-800`}>
+                        <th className="sticky left-0 z-10 w-32 border-r border-[#E4DDD2] bg-[#F5F1EB] px-3 py-2.5 text-left font-bold">
                           姓名
                         </th>
                         <th
                           colSpan={2}
-                          className="border-r border-zinc-300 bg-zinc-100 px-2 py-2.5 text-center font-bold dark:border-zinc-700 dark:bg-zinc-800 print:bg-zinc-200"
+                          className="border-r border-[#E4DDD2] bg-[#F5F1EB] px-2 py-2.5 text-center font-bold"
                         >
                           職位
                         </th>
@@ -1503,46 +1984,40 @@ export default function Home() {
                           return (
                             <th
                               key={day}
-                              className={`border-r border-zinc-300 px-2 py-2 text-center font-semibold dark:border-zinc-700 ${
-                                isActive ? "bg-indigo-100 dark:bg-indigo-950/60 print:bg-zinc-200" : ""
+                              className={`border-r border-[#E4DDD2] px-2 py-2 text-center font-semibold ${
+                                isActive ? "bg-[#E8F3F0] text-[#167763]" : "bg-[#F5F1EB]"
                               }`}
                             >
                               <div>{h.top}</div>
-                              <div className="font-mono text-[11px] font-normal text-zinc-500 dark:text-zinc-400 print:text-black">
+                              <div className="font-mono text-[11px] font-normal text-zinc-500">
                                 {h.sub}
                               </div>
                             </th>
                           );
                         })}
-                        <th className="w-20 bg-zinc-100 px-2 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
+                        <th className="w-20 bg-[#F5F1EB] px-2 py-2 text-center font-bold">
                           本週工時
                         </th>
-                        <th className="w-16 bg-zinc-100 px-2 py-2 text-center font-bold dark:bg-zinc-800 print:bg-zinc-200">
+                        <th className="w-16 bg-[#F5F1EB] px-2 py-2 text-center font-bold">
                           上班日數
                         </th>
                       </tr>
                     </thead>
                     <tbody>
-                      {orderedEmployees.map((emp, rowIdx) => {
-                        const stats = empHoursMap.get(emp);
-                        const over60 = (stats?.totalHours ?? 0) > 60;
+                      {orderedEmployees.map((emp) => {
+                        const weekHours = weekHoursFor(emp);
+                        const over60 = weekHours > 60;
+                        const parts = roleParts(employeeByName.get(emp), empMeta.get(emp));
                         return (
-                          <tr
-                            key={emp}
-                            className={`border-b border-zinc-200 dark:border-zinc-800 ${
-                              rowIdx % 2 === 0
-                                ? "bg-white dark:bg-zinc-950"
-                                : "bg-zinc-50/60 dark:bg-zinc-900/60"
-                            }`}
-                          >
-                            <td className="sticky left-0 z-10 border-r border-zinc-300 bg-inherit px-3 py-2 font-semibold text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 print:text-black">
+                          <tr key={emp} className={`border-b ${ROWLINE} hover:bg-[#FBF8F3]`}>
+                            <td className="sticky left-0 z-10 border-r border-[#E4DDD2] bg-white px-3 py-2 font-semibold text-zinc-900">
                               {emp}
                             </td>
-                            <td className="border-r border-zinc-200 px-2 py-2 text-center font-mono text-[11px] text-zinc-700 dark:border-zinc-800 dark:text-zinc-200">
-                              {roleParts(employeeByName.get(emp)).rank}
+                            <td className="border-r border-[#EFE9E0] px-2 py-2 text-center font-mono text-[11px] text-zinc-700">
+                              {parts.rank || "—"}
                             </td>
-                            <td className="border-r border-zinc-300 px-2 py-2 text-center font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:text-zinc-200">
-                              {roleParts(employeeByName.get(emp)).kind}
+                            <td className="border-r border-[#E4DDD2] px-2 py-2 text-center font-mono text-[11px] text-zinc-700">
+                              {parts.kind}
                             </td>
                             {weekDays.map((day) => {
                               const cell = getCellDisplay(emp, day);
@@ -1550,17 +2025,24 @@ export default function Home() {
                               return (
                                 <td
                                   key={day}
-                                  className={`border-r border-zinc-200 px-1.5 py-1.5 text-center dark:border-zinc-800 ${
-                                    isActive ? "bg-indigo-50/70 dark:bg-indigo-950/30 print:bg-transparent" : ""
+                                  className={`border-r border-[#EFE9E0] px-1.5 py-1.5 text-center ${
+                                    isActive ? "bg-[#E8F3F0]/60" : ""
                                   }`}
                                 >
                                   {cell.kind === "work" ? (
-                                    <div className="font-mono text-[11px] font-medium text-zinc-800 dark:text-zinc-200 print:text-black">
-                                      {cell.label}
+                                    <div className="flex w-full flex-col items-center px-1 py-0.5">
+                                      <span className="font-mono text-[11px] font-medium text-zinc-800">
+                                        {cell.label}
+                                      </span>
+                                      {cell.sub ? (
+                                        <span className="font-mono text-[9px] text-zinc-500">
+                                          {cell.sub}
+                                        </span>
+                                      ) : null}
                                     </div>
                                   ) : cell.kind === "leave" ? (
                                     <span
-                                      className="text-[11px] font-medium text-rose-700 dark:text-rose-300 print:font-bold print:text-black"
+                                      className="text-[11px] font-medium text-rose-700 print:font-bold print:text-black"
                                       title={`第${cell.label.slice(1)}天假`}
                                     >
                                       {cell.label}
@@ -1579,13 +2061,13 @@ export default function Home() {
                             <td
                               className={`px-2 py-2 text-center font-mono font-semibold ${
                                 over60
-                                  ? "bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-300 print:bg-white print:text-black"
-                                  : "text-zinc-800 dark:text-zinc-200 print:text-black"
+                                  ? "bg-red-50 text-red-700"
+                                  : "text-zinc-800"
                               }`}
                             >
-                              {stats ? formatHours(stats.totalHours) : "0h"}
+                              {formatHours(weekHours)}
                             </td>
-                            <td className="px-2 py-2 text-center font-mono text-zinc-700 dark:text-zinc-200">
+                            <td className="px-2 py-2 text-center font-mono text-zinc-700">
                               {workDayCount(emp)}
                             </td>
                           </tr>
@@ -1596,18 +2078,18 @@ export default function Home() {
                       {hourSummaryRows.map((row) => (
                         <tr
                           key={row.key}
-                          className="border-t border-zinc-300 bg-zinc-100 font-semibold dark:border-zinc-700 dark:bg-zinc-800"
+                          className="border-t border-[#E4DDD2] bg-[#F5F1EB] font-semibold"
                         >
                           <td
                             colSpan={3}
-                            className="sticky left-0 z-10 border-r border-zinc-300 bg-zinc-100 px-3 py-1.5 text-left dark:border-zinc-700 dark:bg-zinc-800"
+                            className="sticky left-0 z-10 border-r border-[#E4DDD2] bg-[#F5F1EB] px-3 py-1.5 text-left"
                           >
                             {row.label}
                           </td>
                           {row.values.map((hours, index) => (
                             <td
                               key={weekDays[index]}
-                              className="border-r border-zinc-200 px-1 py-1.5 text-center font-mono text-[11px] dark:border-zinc-800"
+                              className="border-r border-[#EFE9E0] px-1 py-1.5 text-center font-mono text-[11px]"
                             >
                               {formatHours(hours)}
                             </td>
@@ -1621,10 +2103,10 @@ export default function Home() {
                     </tfoot>
                   </table>
                 </div>
-                <div className="hidden print:block overflow-x-auto rounded-lg border border-zinc-300 print:overflow-visible print:border-none">
-                  <table className="print-table w-full min-w-[920px] border-collapse text-xs">
+                <div className={`print-module hidden overflow-x-auto print:overflow-visible ${printWeekGrid ? "print:block" : ""}`}>
+                  <table className="print-table w-full border-collapse text-xs">
                     <thead>
-                      <tr className="border-b border-zinc-300 bg-zinc-100 print:bg-zinc-200">
+                      <tr className="border-b border-black">
                         <th className="px-3 py-2.5 text-left font-bold">姓名</th>
                         <th colSpan={2} className="px-2 py-2.5 text-center font-bold">職位</th>
                         {weekDays.map((day) => {
@@ -1641,29 +2123,32 @@ export default function Home() {
                       </tr>
                     </thead>
                     <tbody>
-                      {orderedEmployees.map((emp) => (
-                        <tr key={`print-${emp}`} className="border-b border-zinc-200">
-                          <td className="px-3 py-2 font-semibold">{emp}</td>
-                          <td className="px-2 py-2 text-center font-mono">{roleParts(employeeByName.get(emp)).rank}</td>
-                          <td className="px-2 py-2 text-center font-mono">{roleParts(employeeByName.get(emp)).kind}</td>
-                          {weekDays.map((day) => {
-                            const cell = getCellDisplay(emp, day);
-                            return (
-                              <td key={day} className="px-1.5 py-1.5 text-center">
-                                <div className="font-mono text-[11px]">{cell.label}</div>
-                              </td>
-                            );
-                          })}
-                          <td className="px-2 py-2 text-center font-mono font-semibold">
-                            {formatHours(empHoursMap.get(emp)?.totalHours ?? 0)}
-                          </td>
-                          <td className="px-2 py-2 text-center font-mono">{workDayCount(emp)}</td>
-                        </tr>
-                      ))}
+                      {orderedEmployees.map((emp) => {
+                        const parts = roleParts(employeeByName.get(emp), empMeta.get(emp));
+                        return (
+                          <tr key={`print-${emp}`} className="border-b border-[#999999]">
+                            <td className="px-3 py-2 font-semibold">{emp}</td>
+                            <td className="px-2 py-2 text-center font-mono">{parts.rank || "—"}</td>
+                            <td className="px-2 py-2 text-center font-mono">{parts.kind}</td>
+                            {weekDays.map((day) => {
+                              const cell = getCellDisplay(emp, day);
+                              return (
+                                <td key={day} className="px-1.5 py-1.5 text-center">
+                                  <div className="font-mono text-[11px]">{cell.label}</div>
+                                </td>
+                              );
+                            })}
+                            <td className="px-2 py-2 text-center font-mono font-semibold">
+                              {formatHours(weekHoursFor(emp))}
+                            </td>
+                            <td className="px-2 py-2 text-center font-mono">{workDayCount(emp)}</td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                     <tfoot>
                       {hourSummaryRows.map((row) => (
-                        <tr key={`print-${row.key}`} className="border-t border-zinc-300 font-semibold">
+                        <tr key={`print-${row.key}`} className="border-t border-black font-semibold">
                           <td colSpan={3} className="px-3 py-1.5">{row.label}</td>
                           {row.values.map((hours, index) => (
                             <td key={weekDays[index]} className="px-1 py-1.5 text-center font-mono">
@@ -1683,6 +2168,47 @@ export default function Home() {
               )}
             </div>
 
+            {printPeriodGrid ? (
+              <div className="print-module">
+                <h3 className="mb-2 text-sm font-semibold">每日六大時段人手安排表</h3>
+                <div className="overflow-x-auto rounded-xl border border-[#E4DDD2] print:overflow-visible print:rounded-none print:border-black">
+                  <table className="print-table w-full min-w-[640px] border-collapse text-xs">
+                    <thead>
+                      <tr className={`border-b border-[#E4DDD2] ${PANEL} text-zinc-700`}>
+                        <th className={`${TH} text-left`}>時段</th>
+                        {weekDays.map((day, index) => (
+                          <th key={day} className={TH}>
+                            {(DAY_EN[index] ?? "").toUpperCase()}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {SERVICE_PERIODS.map((period) => (
+                        <tr key={period.id} className={`border-b ${ROWLINE}`}>
+                          <td className="px-2 py-1.5 text-left font-medium">{period.shortLabel}</td>
+                          {weekDays.map((day) => {
+                            const cell = coverageDays
+                              .find((item) => item.date === day)
+                              ?.periods.find((item) => item.id === period.id);
+                            const short = cell ? !cell.ok : false;
+                            return (
+                              <td
+                                key={day}
+                                className={`px-1 py-1.5 text-center font-mono ${short ? "font-bold text-rose-600 print:text-black" : ""}`}
+                              >
+                                {cell ? `${cell.actual}/${cell.required}` : "—"}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+
             <div className="no-print">
               <h3 className="text-sm font-semibold">後補名單（{reserveEmployees.length} 人）</h3>
               {reserveEmployees.length === 0 ? (
@@ -1692,7 +2218,7 @@ export default function Home() {
                   {reserveEmployees.map((emp) => (
                     <li
                       key={emp.name}
-                      className="rounded-lg border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-700"
+                      className="rounded-lg border border-[#E4DDD2] bg-white px-3 py-2 text-sm"
                     >
                       <span className="font-medium">{emp.name}</span>
                       {emp.phone ? (
@@ -1707,6 +2233,149 @@ export default function Home() {
         ) : null}
 
       </div>
+
+      {/* 手改時間面板 */}
+      {editCell ? (
+        <div className="no-print fixed inset-0 z-50 flex items-center justify-center px-4">
+          <div
+            className="absolute inset-0 bg-zinc-950/40 backdrop-blur-[1px]"
+            onClick={() => (savingCell ? null : setEditCell(null))}
+            aria-hidden
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="修改上班時間"
+            className="relative w-full max-w-md rounded-2xl border border-[#E4DDD2] bg-white p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-base font-semibold text-zinc-900">修改上班時間</h3>
+                <p className="mt-0.5 truncate text-xs text-zinc-500">
+                  {editCell.employee} · {formatDayHeader(editCell.day).top}{" "}
+                  {formatDayHeader(editCell.day).sub}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => (savingCell ? null : setEditCell(null))}
+                aria-label="關閉"
+                className="rounded-md px-2 py-1 text-lg leading-none text-zinc-500 transition hover:bg-[#F5F1EB]"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className={`mt-3 rounded-lg px-3 py-2 text-[11px] text-zinc-600 ${PANEL}`}>
+              連續時段已合併成上班至落班；中間有空隙先分兩段。確認後送{" "}
+              <code className="font-mono">/api/rosters</code>（
+              <code className="font-mono">action: recalculate</code>）重算當日工時、本週工時同每日總工時。
+            </p>
+
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              <button type="button" onClick={() => applyTimeShortcut("early1")} className={BTN_GHOST}>
+                早收 1h
+              </button>
+              <button type="button" onClick={() => applyTimeShortcut("early2")} className={BTN_GHOST}>
+                早收 2h
+              </button>
+              <button type="button" onClick={() => applyTimeShortcut("half")} className={BTN_GHOST}>
+                半日更
+              </button>
+            </div>
+
+            <div className="mt-3">
+              <div className="flex items-center justify-between">
+                <span className={LBL}>當日時段（{editCell.segments.length} 段）</span>
+                <button
+                  type="button"
+                  onClick={addSegment}
+                  className="rounded-md border border-[#1D8A74] bg-white px-2.5 py-1 text-xs font-medium text-[#167763] transition hover:bg-[#E8F3F0]"
+                >
+                  ＋ 新增時段
+                </button>
+              </div>
+
+              <div className="mt-2 max-h-72 space-y-2 overflow-y-auto pr-0.5">
+                {editCell.segments.length === 0 ? (
+                  <p className="rounded-lg border border-dashed border-[#E4DDD2] px-3 py-3 text-center text-xs text-zinc-500">
+                    已移除全部時段，請按「＋ 新增時段」或取消。
+                  </p>
+                ) : (
+                  editCell.segments.map((seg, index) => (
+                    <div
+                      key={seg.key}
+                      className="rounded-lg border border-[#E4DDD2] bg-[#F5F1EB]/60 p-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-semibold text-zinc-600">
+                          第 {index + 1} 段
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => removeSegment(seg.key)}
+                          className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-rose-600 transition hover:bg-rose-50"
+                        >
+                          移除
+                        </button>
+                      </div>
+                      <div className="mt-1.5 grid grid-cols-2 gap-2">
+                        <label className="block">
+                          <span className={LBL}>上班</span>
+                          <input
+                            type="time"
+                            value={seg.start}
+                            onChange={(e) => patchSegment(seg.key, "start", e.target.value)}
+                            className={FIELD}
+                          />
+                        </label>
+                        <label className="block">
+                          <span className={LBL}>落班</span>
+                          <input
+                            type="time"
+                            value={seg.end}
+                            onChange={(e) => patchSegment(seg.key, "end", e.target.value)}
+                            className={FIELD}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditCell(null)}
+                disabled={savingCell}
+                className={BTN_GHOST}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmTimeEdit()}
+                disabled={savingCell}
+                className={BTN_PRIMARY}
+              >
+                {savingCell ? "重算中..." : "確認並重算"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfigDrawer
+        open={configOpen}
+        onClose={() => setConfigOpen(false)}
+        onSaved={() => {
+          void loadRosters(selectedId);
+          void loadStats();
+          setFeedback("店舖／員工設定已儲存，已同步重新載入更表與人數。");
+        }}
+      />
     </div>
   );
 }

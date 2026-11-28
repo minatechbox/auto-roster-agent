@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { EMPLOYMENT_TYPES, type EmploymentType } from "@/lib/types";
 
 type Row = Record<string, unknown>;
-type Target = "store" | "employee" | "reserve" | "rules" | "template";
+type Target = "store" | "employee" | "reserve" | "rules";
 type Tab = "employees" | "reserve" | "rules" | "store";
 type Hydrate = "all" | "rules" | "store" | "none";
 type Month = "30" | "31";
@@ -14,7 +14,7 @@ type Kind = "employee" | "reserve";
 interface Stats { totalCount: number; ftCount: number; hftCount: number; ptCount: number }
 interface ConfigRes {
   store?: Row | null; employees?: Row[]; reserve_staff?: Row[]; roster_rules?: Row[];
-  roster_templates?: Row[]; stats?: Stats; error?: string;
+  stats?: Stats; error?: string;
 }
 export interface ConfigDrawerProps {
   open: boolean;
@@ -43,7 +43,10 @@ const MONTHS = ["30", "31"] as const;
 const MTYPES = ["FT", "HFT"] as const;
 const TABS: { key: Tab; label: string }[] = [
   { key: "employees", label: "正選員工" }, { key: "reserve", label: "後備名單" },
-  { key: "rules", label: "排班規則" }, { key: "store", label: "分店與模板" }];
+  { key: "rules", label: "排班規則" }, { key: "store", label: "分店資料" }];
+
+/** 後台解鎖密碼；未設定環境變數時用預設 8888。 */
+const MANAGER_PIN = process.env.NEXT_PUBLIC_MANAGER_PIN || "8888";
 
 // 清新東南亞現代風：底紙 #FFFFFF · 柔灰區塊／表頭 #F5F1EB
 // 分隔線 #E4DDD2 / #EFE9E0 · 翡翠青 #1D8A74 · hover #167763 · 淺底 #E8F3F0
@@ -60,7 +63,6 @@ const MONO = `${TD} font-mono`;
 const CARD = "rounded-xl border border-[#E4DDD2] dark:border-zinc-700";
 const THEAD = "bg-[#F5F1EB] dark:bg-zinc-800";
 const ROWLINE = "border-t border-[#EFE9E0] dark:border-zinc-800";
-const PANEL = "bg-[#F5F1EB] dark:bg-zinc-800";
 const CHK = "h-3.5 w-3.5 accent-[#1D8A74]";
 const NOTE = "rounded-lg border px-3 py-2 text-xs";
 
@@ -102,7 +104,41 @@ interface RulesForm {
   monthly: Record<Month, Record<MType, { target: string; daily: string }>>;
   otTrigger: string; otCap: string; deficit: string; statutory: string;
 }
-interface StoreForm { store_name: string; address: string; phone: string }
+/** 自訂規則只存入 shift_time_slots.customRules，與 servicePeriods、byEmployment 並存。 */
+interface CustomRule {
+  id: string; name: string; scope: string; params: string; detail: string; active: boolean;
+}
+type PinTarget = { kind: Kind; row: Row } | { kind: "custom"; id: string; name: string };
+interface StoreForm {
+  store_name: string; address: string; phone: string;
+  hours: Record<string, { start: string; end: string }>;
+}
+
+/** 六大時段的預設時間（與 migration_v2.sql 預設值一致）。 */
+const DEFAULT_HOURS: Record<string, { start: string; end: string }> = {
+  opening: { start: "06:00", end: "07:00" }, breakfast: { start: "07:00", end: "11:30" },
+  lunch: { start: "11:30", end: "14:00" }, tea: { start: "14:00", end: "17:00" },
+  dinner: { start: "17:00", end: "22:00" }, closing: { start: "22:00", end: "23:00" },
+};
+const blankHours = () => Object.fromEntries(
+  PERIODS.map(([id]) => [id, { ...DEFAULT_HOURS[id] }]));
+
+/** shift_time_slots 兼容：舊式陣列或 v2 的 { servicePeriods, byEmployment }。 */
+const periodList = (raw: unknown): Row[] => {
+  const list = Array.isArray(raw) ? raw : obj(raw).servicePeriods;
+  return Array.isArray(list)
+    ? list.filter((i): i is Row => !!i && typeof i === "object" && !Array.isArray(i)) : [];
+};
+
+const hoursFromRules = (rule: Row | undefined): StoreForm["hours"] => {
+  const out = blankHours();
+  for (const item of periodList(rule?.shift_time_slots)) {
+    const id = str(item.id);
+    if (!out[id]) continue;
+    out[id] = { start: str(item.start, out[id].start), end: str(item.end, out[id].end) };
+  }
+  return out;
+};
 
 const blankRules = (): RulesForm => {
   const headcount: Record<string, Record<string, string>> = {};
@@ -139,6 +175,22 @@ const rulesToForm = (rule: Row | undefined): RulesForm => {
   f.statutory = String(num(rule.statutory_holidays_yearly));
   return f;
 };
+
+const customRulesFrom = (rule: Row | undefined): CustomRule[] => {
+  const list = obj(rule?.shift_time_slots).customRules;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const r = item as Row;
+    return [{
+      id: str(r.id) || `cr_${i}`, name: str(r.name), scope: str(r.scope),
+      params: str(r.params), detail: str(r.detail), active: r.active !== false,
+    }];
+  });
+};
+
+const withCustomRules = (raw: unknown, customRules: CustomRule[]) =>
+  Array.isArray(raw) ? { servicePeriods: raw, customRules } : { ...obj(raw), customRules };
 
 const empToForm = (row: Row): EmpForm => {
   const fixed = str(row.fixed_shift_time);
@@ -343,8 +395,9 @@ const HEAD: Record<Kind, string[]> = {
   reserve: ["姓名", "職級", "可頂更時段", "聯絡備註", "電話", "優先"],
 };
 
-function ListTable({ kind, rows, onEdit, onToggle }: {
-  kind: Kind; rows: Row[]; onEdit: (row: Row) => void; onToggle: (row: Row, active: boolean) => void;
+function ListTable({ kind, rows, locked, onEdit, onToggle }: {
+  kind: Kind; rows: Row[]; locked: boolean;
+  onEdit: (row: Row) => void; onToggle: (row: Row, active: boolean) => void;
 }) {
   return (
     <div className={`${CARD} overflow-x-auto`}>
@@ -395,7 +448,7 @@ function ListTable({ kind, rows, onEdit, onToggle }: {
                   <div className="flex justify-end gap-1.5">
                     <button type="button" className={SM} onClick={() => onEdit(row)}>編輯</button>
                     <button type="button" className={off ? SM : DANGER} onClick={() => onToggle(row, off)}>
-                      {off ? "復用" : "刪除"}
+                      {off ? "復用" : locked ? "🔒 刪除" : "刪除"}
                     </button>
                   </div>
                 </td>
@@ -420,17 +473,25 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
   const [employees, setEmployees] = useState<Row[]>([]);
   const [reserve, setReserve] = useState<Row[]>([]);
   const [rules, setRules] = useState<Row[]>([]);
-  const [templates, setTemplates] = useState<Row[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
 
   const [showInactive, setShowInactive] = useState(false);
   const [empForm, setEmpForm] = useState<EmpForm | null>(null);
   const [resForm, setResForm] = useState<ResForm | null>(null);
   const [rulesForm, setRulesForm] = useState<RulesForm>(blankRules);
-  const [storeForm, setStoreForm] = useState<StoreForm>({ store_name: "", address: "", phone: "" });
-  const [newTemplate, setNewTemplate] = useState("");
-  const [editingTpl, setEditingTpl] = useState<string | null>(null);
-  const [tplDraft, setTplDraft] = useState("");
+  const [rulesView, setRulesView] = useState<"standard" | "custom">("standard");
+  const [customRules, setCustomRules] = useState<CustomRule[]>([]);
+  const [customForm, setCustomForm] = useState<CustomRule | null>(null);
+  const [storeForm, setStoreForm] = useState<StoreForm>({
+    store_name: "", address: "", phone: "", hours: blankHours(),
+  });
+
+  /** 刪除保護：只有「刪除／停用」需要經理密碼，新增與編輯不受限。 */
+  const [unlocked, setUnlocked] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState<string | null>(null);
+  /** 待執行的停用操作；非 null 時顯示密碼確認彈窗。 */
+  const [pinTarget, setPinTarget] = useState<PinTarget | null>(null);
 
   const storeName = str(store?.store_name);
 
@@ -438,14 +499,17 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
     setStore(data.store ?? null);
     setEmployees(Array.isArray(data.employees) ? data.employees : []);
     setReserve(Array.isArray(data.reserve_staff) ? data.reserve_staff : []);
-    setTemplates(Array.isArray(data.roster_templates) ? data.roster_templates : []);
     const ruleRows = Array.isArray(data.roster_rules) ? data.roster_rules : [];
     setRules(ruleRows);
     setStats(data.stats ?? null);
-    if (hydrate === "all" || hydrate === "rules") setRulesForm(rulesToForm(ruleRows[0]));
+    if (hydrate === "all" || hydrate === "rules") {
+      setRulesForm(rulesToForm(ruleRows[0]));
+      setCustomRules(customRulesFrom(ruleRows[0]));
+      setCustomForm(null);
+    }
     if (hydrate === "all" || hydrate === "store") {
       setStoreForm({ store_name: str(data.store?.store_name), address: str(data.store?.address),
-        phone: str(data.store?.phone) });
+        phone: str(data.store?.phone), hours: hoursFromRules(ruleRows[0]) });
     }
   }, []);
 
@@ -482,8 +546,10 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
       setNotice("已儲存設定");
       done?.();
       onSaved?.();
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : "儲存設定時發生錯誤");
+      return false;
     } finally {
       setSaving(null);
     }
@@ -493,18 +559,35 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
     if (!open) return;
     // microtask 推遲 setState，避免 effect 同步觸發連鎖 render
     void Promise.resolve().then(() => {
-      setEmpForm(null); setResForm(null); setEditingTpl(null);
+      setEmpForm(null); setResForm(null); setCustomForm(null); setRulesView("standard");
       setError(null); setNotice(null);
+      setUnlocked(false); setPin(""); setPinError(null); setPinTarget(null);
       void load();
     });
   }, [open, load]);
 
+  /** 關閉抽屜：一律重新上鎖。 */
+  const closeDrawer = useCallback(() => {
+    setUnlocked(false); setPin(""); setPinError(null); setPinTarget(null);
+    setEmpForm(null); setResForm(null);
+    onClose();
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeDrawer(); };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, closeDrawer]);
+
+  const unlock = () => {
+    if (pin !== MANAGER_PIN) { setPinError("經理權限密碼不正確。"); return; }
+    setPin(""); setPinError(null); setUnlocked(true);
+  };
+  const lockNow = () => {
+    setUnlocked(false); setPin(""); setPinError(null); setPinTarget(null);
+    setEmpForm(null); setResForm(null);
+  };
 
   const visibleEmp = useMemo(
     () => (showInactive ? employees : employees.filter((r) => r.is_active !== false)),
@@ -512,15 +595,6 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
   const visibleRes = useMemo(
     () => (showInactive ? reserve : reserve.filter((r) => r.is_active !== false)),
     [reserve, showInactive]);
-  const periodTimes = useMemo(() => {
-    const raw = obj(rules[0]?.shift_time_slots).servicePeriods;
-    const list: Row[] = Array.isArray(raw)
-      ? raw.filter((i): i is Row => !!i && typeof i === "object" && !Array.isArray(i)) : [];
-    return PERIODS.map(([id, label]) => {
-      const found = list.find((i) => str(i.id) === id);
-      return { id, label, time: found ? `${str(found.start, "?")}-${str(found.end, "?")}` : "—" };
-    });
-  }, [rules]);
 
   function newEmp() {
     setError(null);
@@ -570,14 +644,68 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
     void save("reserve", payload, "reserve", "none", () => setResForm(null));
   }
 
-  /** 軟刪除：員工／後備只改 is_active，不動其他欄位。 */
+  /** 軟刪除：員工／後備只改 is_active，不動其他欄位。停用需先解鎖。 */
+  function applyActive(kind: Kind, row: Row, active: boolean) {
+    const id = str(row.id);
+    if (!id) { setError("此紀錄缺少 ID，無法更新狀態。"); return; }
+    void save(kind, { id, is_active: active }, kind);
+  }
+
   function setActive(kind: Kind, row: Row, active: boolean) {
     const id = str(row.id);
     if (!id) { setError("此紀錄缺少 ID，無法更新狀態。"); return; }
     const label = str(row.name, "此紀錄");
-    if (!window.confirm(active ? `確定復用「${label}」？` : `確定停用「${label}」？`)) return;
-    void save(kind, { id, is_active: active }, kind);
+    // 復用不受鎖限制；停用必須先解鎖（未解鎖時彈出密碼確認）。
+    if (active) {
+      if (!window.confirm(`確定復用「${label}」？`)) return;
+      applyActive(kind, row, true);
+      return;
+    }
+    if (!unlocked) { setPinTarget({ kind, row }); setPin(""); setPinError(null); return; }
+    if (!window.confirm(`確定停用「${label}」？`)) return;
+    applyActive(kind, row, false);
   }
+
+  /** 刪除確認彈窗：密碼正確 → 解鎖並立即執行該次停用。 */
+  function confirmPin() {
+    if (pin !== MANAGER_PIN) { setPinError("經理權限密碼不正確。"); return; }
+    const target = pinTarget;
+    setPin(""); setPinError(null); setPinTarget(null); setUnlocked(true);
+    if (!target) return;
+    if (target.kind === "custom") {
+      setCustomRules((list) => list.filter((r) => r.id !== target.id));
+      return;
+    }
+    applyActive(target.kind, target.row, false);
+  }
+
+  function commitCustom() {
+    if (!customForm) return;
+    const name = customForm.name.trim();
+    if (!name) { setError("請輸入規則名稱。"); return; }
+    const next: CustomRule = {
+      ...customForm, name, scope: customForm.scope.trim(), params: customForm.params.trim(),
+      detail: customForm.detail.trim(),
+      id: customForm.id || crypto.randomUUID(),
+    };
+    setCustomRules((list) => (customForm.id
+      ? list.map((r) => (r.id === customForm.id ? next : r)) : [...list, next]));
+    setCustomForm(null); setError(null);
+  }
+
+  function askRemoveCustom(rule: CustomRule) {
+    const label = rule.name || "未命名";
+    if (!unlocked) {
+      setPinTarget({ kind: "custom", id: rule.id, name: label });
+      setPin(""); setPinError(null);
+      return;
+    }
+    if (!window.confirm(`確定刪除自訂規則「${label}」？`)) return;
+    setCustomRules((list) => list.filter((r) => r.id !== rule.id));
+  }
+
+  const patchCustom = (patch: Partial<CustomRule>) =>
+    setCustomForm((prev) => (prev ? { ...prev, ...patch } : prev));
 
   const setHc = (id: string, d: string) => (v: string) =>
     setRulesForm((p) => ({ ...p, headcount: { ...p.headcount, [id]: { ...p.headcount[id], [d]: v } } }));
@@ -589,6 +717,14 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
     setRulesForm((p) => ({ ...p, [k]: v }));
 
   function saveRules() {
+    if (customForm) { setError("請先按「加入列表」或「更新列表」，再儲存排班規則。"); return; }
+    const ruleId = str(rules[0]?.id);
+    const shift_time_slots = withCustomRules(rules[0]?.shift_time_slots, customRules);
+    if (!unlocked) {
+      if (!ruleId) { setError("未有排班規則紀錄，請先解鎖並儲存一次標準規則。"); return; }
+      void save("rules", { id: ruleId, shift_time_slots }, "rules", "rules");
+      return;
+    }
     const headcount: Record<string, Record<string, number>> = {};
     for (const [id] of PERIODS) {
       headcount[id] = {};
@@ -607,35 +743,32 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
         deficitTriggerHours: num(rulesForm.deficit),
       },
       statutory_holidays_yearly: num(rulesForm.statutory),
+      shift_time_slots,
     };
-    const ruleId = str(rules[0]?.id);
     if (ruleId) payload.id = ruleId;
     void save("rules", payload, "rules", "rules");
   }
 
-  function saveStore() {
+  async function saveStore() {
     if (!storeForm.store_name.trim()) { setError("請輸入分店名稱。"); return; }
-    void save("store", {
+    for (const [id, label] of PERIODS) {
+      const h = storeForm.hours[id];
+      if (!h?.start || !h?.end) { setError(`請填寫「${label}」的開始與結束時間。`); return; }
+      if (h.end <= h.start) { setError(`「${label}」的結束時間必須晚於開始時間。`); return; }
+    }
+    const ok = await save("store", {
       store_name: storeForm.store_name.trim(),
       address: storeForm.address.trim() || null,
       phone: storeForm.phone.trim() || null,
     }, "store", "store");
-  }
-
-  function createTemplate() {
-    const name = newTemplate.trim();
-    if (!name) { setError("請輸入模板名稱。"); return; }
-    void save("template", {
-      template_name: name, department: storeForm.store_name.trim() || null,
-      schedule: { days: [], shifts: [], assignments: [] },
-    }, "template", "none", () => setNewTemplate(""));
-  }
-
-  function renameTemplate(id: string) {
-    if (!id) { setError("此模板缺少 ID，無法改名。"); return; }
-    const name = tplDraft.trim();
-    if (!name) { setError("請輸入模板名稱。"); return; }
-    void save("template", { id, template_name: name }, "template", "none", () => setEditingTpl(null));
+    if (!ok) return;
+    // 六大時段一併寫回 roster_rules.shift_time_slots（保留 v2 的 byEmployment）
+    const ruleId = str(rules[0]?.id);
+    if (!ruleId) return; // 未建立排班規則紀錄時只存分店基本資料
+    const raw = rules[0]?.shift_time_slots;
+    const servicePeriods = PERIODS.map(([id]) => ({ id, ...storeForm.hours[id] }));
+    const shift_time_slots = Array.isArray(raw) ? servicePeriods : { ...obj(raw), servicePeriods };
+    await save("rules", { id: ruleId, shift_time_slots }, "store", "store");
   }
 
   if (!open) return null;
@@ -650,9 +783,9 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
 
   return (
     <div className="no-print fixed inset-0 z-50 flex justify-end">
-      <div className="absolute inset-0 bg-zinc-950/40 backdrop-blur-[1px]" onClick={onClose} aria-hidden />
+      <div className="absolute inset-0 bg-zinc-950/40 backdrop-blur-[1px]" onClick={closeDrawer} aria-hidden />
       <aside role="dialog" aria-modal="true" aria-label="系統設定"
-        className="relative ml-auto flex h-full w-full max-w-3xl flex-col bg-white shadow-2xl dark:bg-zinc-900">
+        className="relative ml-auto flex h-full w-full max-w-5xl flex-col bg-white shadow-2xl dark:bg-zinc-900">
         <header className="flex items-start justify-between gap-3 border-b border-[#E4DDD2] px-5 py-4 dark:border-zinc-800">
           <div className="min-w-0">
             <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">系統設定</h2>
@@ -665,28 +798,53 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
             <button type="button" onClick={() => void load()} disabled={loading} className={SM}>
               {loading ? "載入中..." : "重新載入"}
             </button>
-            <button type="button" onClick={onClose} aria-label="關閉設定"
+            <button type="button" onClick={closeDrawer} aria-label="關閉設定"
               className="rounded-md px-2 py-1 text-lg leading-none text-zinc-500 transition hover:bg-[#F5F1EB] hover:text-zinc-800 dark:hover:bg-zinc-800">
               ✕
             </button>
           </div>
         </header>
 
-        <div className="border-b border-[#E4DDD2] px-5 py-3 dark:border-zinc-800">
-          <div className={`flex flex-wrap gap-1 rounded-lg p-1 ${PANEL}`}>
-            {TABS.map((t) => (
-              <button key={t.key} type="button" onClick={() => setTab(t.key)}
-                className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                  tab === t.key ? "bg-[#1D8A74] text-white shadow-xs hover:bg-[#167763]"
-                    : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
-                }`}>
-                {t.label}
-              </button>
-            ))}
+        {/* ── 刪除保護狀態條 ── */}
+        {unlocked ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-300 bg-emerald-50 px-5 py-2.5 dark:border-emerald-800 dark:bg-emerald-950/40">
+            <p className="text-xs font-medium text-emerald-900 dark:text-emerald-200">
+              🔓 已解鎖：可修改排班規則，以及刪除／停用紀錄（關閉抽屜後自動重新上鎖）
+            </p>
+            <button type="button" onClick={lockNow} className={SM}>立即上鎖</button>
           </div>
-        </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2 border-b border-amber-300 bg-amber-50 px-5 py-2.5 dark:border-amber-800 dark:bg-amber-950/40">
+            <span className="text-xs font-semibold text-amber-900 dark:text-amber-200">
+              🔒 刪除／停用同標準排班規則已上鎖（新增與編輯員工、自訂規則不受限）
+            </span>
+            <input type="password" inputMode="numeric" autoComplete="off" placeholder="經理權限密碼"
+              value={pin} onChange={(e) => { setPin(e.target.value); setPinError(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter") unlock(); }}
+              className="w-40 rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs text-zinc-900 outline-none focus:border-[#1D8A74] focus:ring-2 focus:ring-[#1D8A74]/20 dark:border-amber-800 dark:bg-zinc-950 dark:text-zinc-100" />
+            <button type="button" onClick={unlock} className={SM}>解鎖</button>
+            {pinError ? <span className="text-xs font-medium text-rose-600">{pinError}</span> : null}
+          </div>
+        )}
 
-        <div className="flex-1 space-y-3 overflow-y-auto px-5 py-4">
+        <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+          {/* ── 左側直排導航（手機自動變頂部橫排） ── */}
+          <nav aria-label="設定分頁"
+            className="shrink-0 overflow-x-auto border-b border-[#E4DDD2] bg-[#F5F1EB] p-2 dark:border-zinc-800 dark:bg-zinc-800/60 md:w-[190px] md:overflow-visible md:border-b-0 md:border-r">
+            <div className="flex gap-1 md:flex-col">
+              {TABS.map((t) => (
+                <button key={t.key} type="button" onClick={() => setTab(t.key)}
+                  className={`whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition md:w-full md:text-left ${
+                    tab === t.key ? "bg-[#1D8A74] text-white shadow-xs hover:bg-[#167763]"
+                      : "text-zinc-600 hover:bg-white hover:text-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
+                  }`}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </nav>
+
+          <div className="min-w-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
           {error ? <div className={`${NOTE} border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200`}>{error}</div> : null}
           {notice ? <div className={`${NOTE} border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200`}>{notice}</div> : null}
 
@@ -703,7 +861,8 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
                   onSave={saveEmp} onCancel={() => setEmpForm(null)}
                   saving={saving === "employee"} saveLabel="儲存員工" />
               ) : (
-                <ListTable kind="employee" rows={visibleEmp} onEdit={(row) => setEmpForm(empToForm(row))}
+                <ListTable kind="employee" rows={visibleEmp} locked={!unlocked}
+                  onEdit={(row) => setEmpForm(empToForm(row))}
                   onToggle={(row, active) => setActive("employee", row, active)} />
               )}
               <p className="text-[11px] text-zinc-400">刪除採軟刪除（is_active = false），可按「復用」重新啟用。</p>
@@ -723,7 +882,8 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
                   onSave={saveRes} onCancel={() => setResForm(null)}
                   saving={saving === "reserve"} saveLabel="儲存後備人員" />
               ) : (
-                <ListTable kind="reserve" rows={visibleRes} onEdit={(row) => setResForm(resToForm(row))}
+                <ListTable kind="reserve" rows={visibleRes} locked={!unlocked}
+                  onEdit={(row) => setResForm(resToForm(row))}
                   onToggle={(row, active) => setActive("reserve", row, active)} />
               )}
             </div>
@@ -732,6 +892,21 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
           {/* ── 分頁 3：排班規則 ── */}
           {tab === "rules" ? (
             <div className="space-y-4">
+              <div className="flex gap-1">
+                {([["standard", "標準規則"], ["custom", "自訂規則"]] as const).map(([k, label]) => (
+                  <button key={k} type="button" onClick={() => setRulesView(k)}
+                    className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                      rulesView === k ? "bg-[#1D8A74] text-white" : "bg-[#F5F1EB] text-zinc-600 hover:text-zinc-900 dark:bg-zinc-800 dark:text-zinc-300"
+                    }`}>{label}</button>
+                ))}
+              </div>
+            {rulesView === "standard" ? (
+            <fieldset disabled={!unlocked} className="min-w-0 space-y-4 border-0 p-0 disabled:opacity-70">
+              {unlocked ? null : (
+                <p className="text-xs font-medium text-amber-800 dark:text-amber-200">
+                  🔒 排班規則已上鎖。請用上方經理密碼解鎖後先可修改。
+                </p>
+              )}
               <Section title="每日六大時段所需人數" hint="列 = 營業時段；欄 = 星期日 → 星期六。單位：人。">
                 <div className={`mt-2 ${CARD} overflow-x-auto`}>
                   <table className="w-full min-w-[620px] border-collapse text-xs">
@@ -804,14 +979,87 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
               </Section>
 
               <div className="flex justify-end">
-                <button type="button" onClick={saveRules} disabled={saving === "rules"} className={BTN}>
+                <button type="button" onClick={saveRules} disabled={!unlocked || saving === "rules"} className={BTN}>
                   {saving === "rules" ? "儲存中..." : "儲存排班規則"}
                 </button>
               </div>
+            </fieldset>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[11px] text-zinc-500">新增同編輯免密碼。刪除要經理密碼。改完請按「儲存排班規則」先寫入資料庫。</p>
+                  <button type="button" className={BTN} disabled={!!customForm}
+                    onClick={() => { setError(null); setCustomForm({ id: "", name: "", scope: "", params: "", detail: "", active: true }); }}>
+                    ＋ 新增自訂規則
+                  </button>
+                </div>
+                {customForm ? (
+                  <div className={`${CARD} space-y-3 p-3`}>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <Atom label="規則名稱 *" value={customForm.name} ph="週末晚市加人"
+                        onChange={(v) => patchCustom({ name: v })} />
+                      <Atom label="適用範圍／條件" value={customForm.scope} ph="Fri–Sat 晚市、全週適用"
+                        onChange={(v) => patchCustom({ scope: v })} />
+                      <Atom label="數值／參數設定" className="sm:col-span-2" value={customForm.params} ph="晚市 +1 人"
+                        onChange={(v) => patchCustom({ params: v })} />
+                    </div>
+                    <label className="block">
+                      <span className={LBL}>詳細規則說明</span>
+                      <textarea rows={3} className={INPUT} value={customForm.detail}
+                        placeholder="例如：颱風／惡劣天氣安排、新人帶教限制"
+                        onChange={(e) => patchCustom({ detail: e.target.value })} />
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-300">
+                      <input type="checkbox" className={CHK} checked={customForm.active}
+                        onChange={(e) => patchCustom({ active: e.target.checked })} />
+                      啟用（Active）
+                    </label>
+                    <div className="flex justify-end gap-2">
+                      <button type="button" className={GHOST} onClick={() => setCustomForm(null)}>取消</button>
+                      <button type="button" className={BTN} onClick={commitCustom}>
+                        {customForm.id ? "更新列表" : "加入列表"}
+                      </button>
+                    </div>
+                  </div>
+                ) : customRules.length === 0 ? (
+                  <p className="text-xs text-zinc-400">尚未有自訂規則。</p>
+                ) : customRules.map((item) => (
+                  <div key={item.id} className={`${CARD} flex flex-wrap items-start justify-between gap-2 p-3`}>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                        {item.name}
+                        <span className={`ml-2 text-[11px] ${item.active ? "text-[#1D8A74]" : "text-zinc-400"}`}>
+                          {item.active ? "啟用" : "停用"}
+                        </span>
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-zinc-500">
+                        {item.scope || "未填範圍"}{item.params ? ` · ${item.params}` : ""}
+                      </p>
+                      {item.detail ? <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{item.detail}</p> : null}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <label className="flex items-center gap-1 text-[11px] text-zinc-500">
+                        <input type="checkbox" className={CHK} checked={item.active}
+                          onChange={(e) => setCustomRules((list) => list.map((r) => (
+                            r.id === item.id ? { ...r, active: e.target.checked } : r)))} />
+                        Active
+                      </label>
+                      <button type="button" className={SM} onClick={() => { setError(null); setCustomForm(item); }}>編輯</button>
+                      <button type="button" className={DANGER} onClick={() => askRemoveCustom(item)}>刪除</button>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex justify-end">
+                  <button type="button" onClick={saveRules} disabled={saving === "rules"} className={BTN}>
+                    {saving === "rules" ? "儲存中..." : "儲存排班規則"}
+                  </button>
+                </div>
+              </div>
+            )}
             </div>
           ) : null}
 
-          {/* ── 分頁 4：分店與模板 ── */}
+          {/* ── 分頁 4：分店資料 ── */}
           {tab === "store" ? (
             <div className="space-y-4">
               <Section title="分店資料">
@@ -822,77 +1070,75 @@ export default function ConfigDrawer({ open, onClose, onSaved, storeId }: Config
                     onChange={(v) => setStoreForm((p) => ({ ...p, address: v }))} />
                   <Atom label="電話" value={storeForm.phone}
                     onChange={(v) => setStoreForm((p) => ({ ...p, phone: v }))} />
-                  <div className="flex justify-end">
-                    <button type="button" onClick={saveStore} disabled={saving === "store"} className={BTN}>
-                      {saving === "store" ? "儲存中..." : "儲存分店資料"}
-                    </button>
-                  </div>
                 </div>
               </Section>
 
-              <Section title="營業時間（六大時段）" hint="如需調整時間，請到「排班規則」分頁修改六大時段設定。">
-                <ul className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-                  {periodTimes.map((item) => (
-                    <li key={item.id} className="rounded-lg bg-[#F5F1EB] px-2.5 py-1.5 text-xs text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
-                      <span className="font-medium">{item.label}</span>
-                      <span className="ml-1.5 font-mono text-[11px] text-zinc-500">{item.time}</span>
-                    </li>
-                  ))}
-                </ul>
+              <Section title="營業時間（六大時段）" hint="可直接修改每個時段的開始與結束時間，按「儲存分店資料」一併存入。">
+                <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {PERIODS.map(([id, label]) => {
+                    const h = storeForm.hours[id] ?? { start: "", end: "" };
+                    const setH = (k: "start" | "end") => (v: string) =>
+                      setStoreForm((p) => ({ ...p, hours: { ...p.hours, [id]: { ...h, [k]: v } } }));
+                    return (
+                      <div key={id} className={`${CARD} p-2.5`}>
+                        <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">{label}</p>
+                        <div className="mt-1.5 grid grid-cols-2 gap-2">
+                          <label className="block">
+                            <span className={LBL}>開始</span>
+                            <input type="time" className={INPUT} value={h.start}
+                              onChange={(e) => setH("start")(e.target.value)} />
+                          </label>
+                          <label className="block">
+                            <span className={LBL}>結束</span>
+                            <input type="time" className={INPUT} value={h.end}
+                              onChange={(e) => setH("end")(e.target.value)} />
+                          </label>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </Section>
 
-              <div className={`${CARD} p-4`}>
-                <Section title="列印更表模板">
-                  <div className="mt-2 flex flex-wrap items-end gap-2">
-                    <Atom label="新模板名稱" className="min-w-[12rem] flex-1" value={newTemplate}
-                      onChange={setNewTemplate} ph="例如：平日標準更表" />
-                    <button type="button" onClick={createTemplate} disabled={saving === "template"} className={BTN}>
-                      ＋ 新增模板
-                    </button>
-                  </div>
-                  <ul className="mt-3 space-y-1.5">
-                    {templates.length === 0 ? (
-                      <li className="text-xs text-zinc-500">暫無模板紀錄。</li>
-                    ) : templates.map((row, i) => {
-                      const id = str(row.id);
-                      return (
-                        <li key={id || `tpl-${i}`}
-                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#EFE9E0] px-2.5 py-1.5 dark:border-zinc-800">
-                          {editingTpl === id ? (
-                            <>
-                              <input className={`${INPUT} mt-0 max-w-xs`} value={tplDraft}
-                                onChange={(e) => setTplDraft(e.target.value)} />
-                              <div className="flex gap-1.5">
-                                <button type="button" onClick={() => setEditingTpl(null)} className={SM}>取消</button>
-                                <button type="button" onClick={() => renameTemplate(id)}
-                                  disabled={saving === "template"} className={SM}>儲存</button>
-                              </div>
-                            </>
-                          ) : (
-                            <>
-                              <div className="min-w-0">
-                                <p className="truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">
-                                  {str(row.template_name, "（未命名模板）")}
-                                </p>
-                                <p className="text-[11px] text-zinc-500">{str(row.department, "未指定部門")}</p>
-                              </div>
-                              <button type="button" className={SM}
-                                onClick={() => { setEditingTpl(id); setTplDraft(str(row.template_name)); }}>
-                                改名
-                              </button>
-                            </>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                  <p className="mt-2 text-[11px] text-zinc-400">目前模板只支援新增與改名，暫不提供刪除。</p>
-                </Section>
+              <div className="flex justify-end">
+                <button type="button" onClick={() => void saveStore()} disabled={saving === "store"} className={BTN}>
+                  {saving === "store" ? "儲存中..." : "儲存分店資料"}
+                </button>
               </div>
             </div>
           ) : null}
+          </div>
         </div>
       </aside>
+
+      {/* ── 刪除確認：經理密碼 ── */}
+      {pinTarget ? (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/50 p-4">
+          <div className="w-full max-w-sm rounded-2xl border border-[#E4DDD2] bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              🔒 需要經理權限
+            </h3>
+            <p className="mt-1 text-xs text-zinc-500">
+              {pinTarget.kind === "custom"
+                ? `即將刪除自訂規則「${pinTarget.name}」。請輸入經理權限密碼確認。`
+                : `即將停用「${str(pinTarget.row.name, "此紀錄")}」。請輸入經理權限密碼確認。`}
+            </p>
+            <input type="password" inputMode="numeric" autoComplete="off" placeholder="經理權限密碼"
+              value={pin} autoFocus
+              onChange={(e) => { setPin(e.target.value); setPinError(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter") confirmPin(); }}
+              className={INPUT} />
+            {pinError ? <p className="mt-1.5 text-xs font-medium text-rose-600">{pinError}</p> : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={GHOST}
+                onClick={() => { setPinTarget(null); setPin(""); setPinError(null); }}>取消</button>
+              <button type="button" className={BTN} onClick={confirmPin}>
+                {pinTarget.kind === "custom" ? "確認刪除" : "確認停用"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
